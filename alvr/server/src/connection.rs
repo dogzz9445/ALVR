@@ -1,28 +1,35 @@
 use crate::{
-    bitrate::BitrateManager, buttons::BUTTON_PATH_FROM_ID, haptics::HapticsManager,
-    sockets::WelcomeSocket, statistics::StatisticsManager, tracking::TrackingManager,
+    bitrate::BitrateManager,
+    buttons::BUTTON_PATH_FROM_ID,
+    face_tracking::FaceTrackingSink,
+    haptics,
+    sockets::WelcomeSocket,
+    statistics::StatisticsManager,
+    tracking::{self, TrackingManager},
     FfiButtonValue, FfiFov, FfiViewsConfig, VideoPacket, BITRATE_MANAGER, CONTROL_CHANNEL_SENDER,
     DECODER_CONFIG, DISCONNECT_CLIENT_NOTIFIER, HAPTICS_SENDER, IS_ALIVE, RESTART_NOTIFIER,
     SERVER_DATA_MANAGER, STATISTICS_MANAGER, VIDEO_RECORDING_FILE, VIDEO_SENDER,
 };
-use alvr_audio::{AudioDevice, AudioDeviceType};
+use alvr_audio::AudioDevice;
 use alvr_common::{
     glam::{UVec2, Vec2},
     once_cell::sync::Lazy,
     parking_lot,
     prelude::*,
-    RelaxedAtomic, DEVICE_ID_TO_PATH, LEFT_HAND_ID, RIGHT_HAND_ID,
+    settings_schema::Switch,
+    RelaxedAtomic, DEVICE_ID_TO_PATH, HEAD_ID, LEFT_HAND_ID, RIGHT_HAND_ID,
 };
-use alvr_events::{ButtonEvent, ButtonValue, EventType, HapticsEvent};
-use alvr_session::{CodecType, FrameSize, OpenvrConfig};
+use alvr_events::{ButtonEvent, EventType, HapticsEvent, TrackingEvent};
+use alvr_packets::{
+    ButtonValue, ClientConnectionResult, ClientControlPacket, ClientListAction, ClientStatistics,
+    ServerControlPacket, StreamConfigPacket, Tracking, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
+};
+use alvr_session::{CodecType, ControllersEmulationMode, FrameSize, OpenvrConfig};
 use alvr_sockets::{
-    spawn_cancelable, ClientConnectionResult, ClientControlPacket, ClientListAction,
-    ClientStatistics, ControlSocketReceiver, ControlSocketSender, PeerType, ProtoControlSocket,
-    ServerControlPacket, StreamConfigPacket, StreamSocketBuilder, Tracking, AUDIO, HAPTICS,
-    KEEPALIVE_INTERVAL, STATISTICS, TRACKING, VIDEO,
+    spawn_cancelable, ControlSocketReceiver, ControlSocketSender, PeerType, ProtoControlSocket,
+    StreamSocketBuilder, KEEPALIVE_INTERVAL,
 };
 use futures::future::BoxFuture;
-use settings_schema::Switch;
 use std::{
     collections::{HashMap, HashSet},
     future,
@@ -51,7 +58,7 @@ fn align32(value: f32) -> u32 {
 }
 
 // Alternate connection trials with manual IPs and clients discovered on the local network
-pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResult {
+pub fn handshake_loop() -> IntResult {
     let mut welcome_socket = WelcomeSocket::new().map_err(to_int_e!())?;
 
     loop {
@@ -70,9 +77,7 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
             manual_client_ips
         };
 
-        if !manual_client_ips.is_empty()
-            && try_connect(manual_client_ips, frame_interval_sender.clone()).is_ok()
-        {
+        if !manual_client_ips.is_empty() && try_connect(manual_client_ips).is_ok() {
             thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
             continue;
         }
@@ -99,8 +104,13 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
             let trusted = {
                 let mut data_manager = SERVER_DATA_MANAGER.write();
 
-                data_manager
-                    .update_client_list(client_hostname.clone(), ClientListAction::AddIfMissing);
+                data_manager.update_client_list(
+                    client_hostname.clone(),
+                    ClientListAction::AddIfMissing {
+                        trusted: false,
+                        manual_ips: vec![],
+                    },
+                );
 
                 if config.auto_trust_clients {
                     data_manager
@@ -116,10 +126,9 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
 
             // do not attempt connection if the client is already connected
             if trusted && !CONNECTED_CLIENT_HOSTNAMES.lock().contains(&client_hostname) {
-                if let Err(e) = try_connect(
-                    [(client_ip, client_hostname.clone())].into_iter().collect(),
-                    frame_interval_sender.clone(),
-                ) {
+                if let Err(e) =
+                    try_connect([(client_ip, client_hostname.clone())].into_iter().collect())
+                {
                     error!("Handshake error for {client_hostname}: {e}");
                 }
             }
@@ -129,10 +138,7 @@ pub fn handshake_loop(frame_interval_sender: smpsc::Sender<Duration>) -> IntResu
     }
 }
 
-fn try_connect(
-    mut client_ips: HashMap<IpAddr, String>,
-    frame_interval_sender: smpsc::Sender<Duration>,
-) -> IntResult {
+fn try_connect(mut client_ips: HashMap<IpAddr, String>) -> IntResult {
     let runtime = Runtime::new().map_err(to_int_e!())?;
 
     let (mut proto_socket, client_ip) = runtime
@@ -158,11 +164,20 @@ fn try_connect(
     );
 
     let maybe_streaming_caps = if let ClientConnectionResult::ConnectionAccepted {
+        client_protocol_id,
         display_name,
         streaming_capabilities,
         ..
     } = runtime.block_on(proto_socket.recv()).map_err(to_int_e!())?
     {
+        if client_protocol_id != alvr_common::protocol_id() {
+            warn!(
+                "Trusted client is incompatible! Expected protocol ID: {}, found: {}",
+                alvr_common::protocol_id(),
+                client_protocol_id,
+            );
+        }
+
         SERVER_DATA_MANAGER.write().update_client_list(
             client_hostname.clone(),
             ClientListAction::SetDisplayName(display_name),
@@ -186,22 +201,32 @@ fn try_connect(
 
     let settings = SERVER_DATA_MANAGER.read().settings().clone();
 
-    let stream_view_resolution = match settings.video.render_resolution {
-        FrameSize::Scale(scale) => streaming_caps.default_view_resolution.as_vec2() * scale,
-        FrameSize::Absolute { width, height } => Vec2::new(width as f32 / 2_f32, height as f32),
-    };
-    let stream_view_resolution = UVec2::new(
-        align32(stream_view_resolution.x),
-        align32(stream_view_resolution.y),
+    fn get_view_res(config: FrameSize, default_res: UVec2) -> UVec2 {
+        let res = match config {
+            FrameSize::Scale(scale) => default_res.as_vec2() * scale,
+            FrameSize::Absolute { width, height } => {
+                let width = width as f32;
+                Vec2::new(
+                    width,
+                    height.map(|h| h as f32).unwrap_or_else(|| {
+                        let default_res = default_res.as_vec2();
+                        width * default_res.y / default_res.x
+                    }),
+                )
+            }
+        };
+
+        UVec2::new(align32(res.x), align32(res.y))
+    }
+
+    let stream_view_resolution = get_view_res(
+        settings.video.transcoding_view_resolution,
+        streaming_caps.default_view_resolution,
     );
 
-    let target_view_resolution = match settings.video.recommended_target_resolution {
-        FrameSize::Scale(scale) => streaming_caps.default_view_resolution.as_vec2() * scale,
-        FrameSize::Absolute { width, height } => Vec2::new(width as f32 / 2_f32, height as f32),
-    };
-    let target_view_resolution = UVec2::new(
-        align32(target_view_resolution.x),
-        align32(target_view_resolution.y),
+    let target_view_resolution = get_view_res(
+        settings.video.emulated_headset_view_resolution,
+        streaming_caps.default_view_resolution,
     );
 
     let fps = {
@@ -224,24 +249,25 @@ fn try_connect(
         warn!("Chosen refresh rate not supported. Using {fps}Hz");
     }
 
-    let game_audio_sample_rate = if let Switch::Enabled(game_audio_desc) = settings.audio.game_audio
+    let game_audio_sample_rate = if let Switch::Enabled(game_audio_config) =
+        settings.audio.game_audio
     {
-        let game_audio_device = AudioDevice::new(
+        let game_audio_device = AudioDevice::new_output(
             Some(settings.audio.linux_backend),
-            &game_audio_desc.device_id,
-            AudioDeviceType::Output,
+            game_audio_config.device.as_ref(),
         )
         .map_err(to_int_e!())?;
 
+        #[cfg(not(target_os = "linux"))]
         if let Switch::Enabled(microphone_desc) = settings.audio.microphone {
-            let microphone_device = AudioDevice::new(
+            let (sink, source) = AudioDevice::new_virtual_microphone_pair(
                 Some(settings.audio.linux_backend),
-                &microphone_desc.input_device_id,
-                AudioDeviceType::VirtualMicrophoneInput,
+                microphone_desc.devices,
             )
             .map_err(to_int_e!())?;
-            #[cfg(not(target_os = "linux"))]
-            if alvr_audio::is_same_device(&game_audio_device, &microphone_device) {
+            if alvr_audio::is_same_device(&game_audio_device, &sink)
+                || alvr_audio::is_same_device(&game_audio_device, &source)
+            {
                 return int_fmt_e!("Game audio and microphone cannot point to the same device!");
             }
         }
@@ -267,47 +293,31 @@ fn try_connect(
     let (mut control_sender, control_receiver) = proto_socket.split();
 
     let mut controllers_mode_idx = 0;
-    let mut controllers_tracking_system_name = "".into();
-    let mut controllers_manufacturer_name = "".into();
-    let mut controllers_model_number = "".into();
-    let mut render_model_name_left_controller = "".into();
-    let mut render_model_name_right_controller = "".into();
-    let mut controllers_serial_number = "".into();
-    let mut controllers_type_left = "".into();
-    let mut controllers_type_right = "".into();
-    let mut controllers_registered_device_type = "".into();
-    let mut controllers_input_profile_path = "".into();
     let mut override_trigger_threshold = false;
     let mut trigger_threshold = 0.0;
     let mut override_grip_threshold = false;
     let mut grip_threshold = 0.0;
-    let mut use_headset_tracking_system = false;
     let controllers_enabled = if let Switch::Enabled(config) = settings.headset.controllers {
-        controllers_mode_idx = config.mode_idx;
-        controllers_tracking_system_name = config.tracking_system_name.clone();
-        controllers_manufacturer_name = config.manufacturer_name.clone();
-        controllers_model_number = config.model_number.clone();
-        render_model_name_left_controller = config.render_model_name_left.clone();
-        render_model_name_right_controller = config.render_model_name_right.clone();
-        controllers_serial_number = config.serial_number.clone();
-        controllers_type_left = config.ctrl_type_left.clone();
-        controllers_type_right = config.ctrl_type_right.clone();
-        controllers_registered_device_type = config.registered_device_type.clone();
-        controllers_input_profile_path = config.input_profile_path.clone();
+        controllers_mode_idx = match config.emulation_mode {
+            ControllersEmulationMode::RiftSTouch => 1,
+            ControllersEmulationMode::ValveIndex => 3,
+            ControllersEmulationMode::ViveWand => 5,
+            ControllersEmulationMode::Quest2Touch => 7,
+            ControllersEmulationMode::ViveTracker => 9,
+        };
         override_trigger_threshold =
-            if let Switch::Enabled(config) = config.override_trigger_threshold {
-                trigger_threshold = config.trigger_threshold;
+            if let Switch::Enabled(value) = config.trigger_threshold_override {
+                trigger_threshold = value;
                 true
             } else {
                 false
             };
-        override_grip_threshold = if let Switch::Enabled(config) = config.override_grip_threshold {
-            grip_threshold = config.grip_threshold;
+        override_grip_threshold = if let Switch::Enabled(value) = config.grip_threshold_override {
+            grip_threshold = value;
             true
         } else {
             false
         };
-        use_headset_tracking_system = config.use_headset_tracking_system;
         true
     } else {
         false
@@ -349,57 +359,42 @@ fn try_connect(
         false
     };
 
-    let nvenc_overrides = settings.video.advanced_codec_options.nvenc_overrides;
-    let amf_controls = settings.video.advanced_codec_options.amf_controls;
+    let nvenc_overrides = settings.video.encoder_config.nvenc;
+    let amf_controls = settings.video.encoder_config.amf;
 
     let new_openvr_config = OpenvrConfig {
-        universe_id: settings.headset.universe_id,
-        headset_serial_number: settings.headset.serial_number,
-        headset_tracking_system_name: settings.headset.tracking_system_name,
-        headset_model_number: settings.headset.model_number,
-        headset_driver_version: settings.headset.driver_version,
-        headset_manufacturer_name: settings.headset.manufacturer_name,
-        headset_render_model_name: settings.headset.render_model_name,
-        headset_registered_device_type: settings.headset.registered_device_type,
         eye_resolution_width: stream_view_resolution.x,
         eye_resolution_height: stream_view_resolution.y,
         target_eye_resolution_width: target_view_resolution.x,
         target_eye_resolution_height: target_view_resolution.y,
-        seconds_from_vsync_to_photons: settings.video.seconds_from_vsync_to_photons,
         tracking_ref_only: settings.headset.tracking_ref_only,
         enable_vive_tracker_proxy: settings.headset.enable_vive_tracker_proxy,
         aggressive_keyframe_resend: settings.connection.aggressive_keyframe_resend,
         adapter_index: settings.video.adapter_index,
-        codec: matches!(settings.video.codec, CodecType::HEVC) as _,
-        rate_control_mode: settings.video.rate_control_mode as u32,
-        filler_data: settings.video.filler_data,
-        entropy_coding: settings.video.entropy_coding as u32,
+        codec: matches!(settings.video.preferred_codec, CodecType::Hevc) as _,
+        rate_control_mode: settings.video.encoder_config.rate_control_mode as u32,
+        filler_data: settings.video.encoder_config.filler_data,
+        entropy_coding: settings.video.encoder_config.entropy_coding as u32,
         refresh_rate: fps as _,
-        use_10bit_encoder: settings.video.use_10bit_encoder,
+        use_10bit_encoder: settings.video.encoder_config.use_10bit,
         enable_vbaq: amf_controls.enable_vbaq,
         use_preproc: amf_controls.use_preproc,
         preproc_sigma: amf_controls.preproc_sigma,
         preproc_tor: amf_controls.preproc_tor,
-        encoder_quality_preset: settings.video.advanced_codec_options.encoder_quality_preset as u32,
-        force_sw_encoding: settings.video.force_sw_encoding,
-        sw_thread_count: settings.video.sw_thread_count,
+        nvenc_quality_preset: nvenc_overrides.quality_preset as u32,
+        amd_encoder_quality_preset: amf_controls.quality_preset as u32,
+        force_sw_encoding: settings
+            .video
+            .encoder_config
+            .software
+            .force_software_encoding,
+        sw_thread_count: settings.video.encoder_config.software.thread_count,
         controllers_enabled,
         controllers_mode_idx,
-        controllers_tracking_system_name,
-        controllers_manufacturer_name,
-        controllers_model_number,
-        render_model_name_left_controller,
-        render_model_name_right_controller,
-        controllers_serial_number,
-        controllers_type_left,
-        controllers_type_right,
-        controllers_registered_device_type,
-        controllers_input_profile_path,
         override_trigger_threshold,
         trigger_threshold,
         override_grip_threshold,
         grip_threshold,
-        use_headset_tracking_system,
         enable_foveated_rendering,
         foveation_center_size_x,
         foveation_center_size_y,
@@ -413,7 +408,7 @@ fn try_connect(
         saturation,
         gamma,
         sharpening,
-        linux_async_reprojection: settings.extra.patches.linux_async_reprojection,
+        linux_async_reprojection: settings.patches.linux_async_reprojection,
         nvenc_tuning_preset: nvenc_overrides.tuning_preset as u32,
         nvenc_multi_pass: nvenc_overrides.multi_pass as u32,
         nvenc_adaptive_quantization_mode: nvenc_overrides.adaptive_quantization_mode as u32,
@@ -431,7 +426,7 @@ fn try_connect(
         rc_max_bitrate: nvenc_overrides.rc_max_bitrate,
         rc_average_bitrate: nvenc_overrides.rc_average_bitrate,
         nvenc_enable_weighted_prediction: nvenc_overrides.enable_weighted_prediction,
-        capture_frame_dir: settings.extra.capture_frame_dir,
+        capture_frame_dir: settings.capture.capture_frame_dir,
     };
 
     if SERVER_DATA_MANAGER.read().session().openvr_config != new_openvr_config {
@@ -469,9 +464,10 @@ fn try_connect(
                         control_receiver,
                         streaming_caps.microphone_sample_rate,
                         fps,
-                        frame_interval_sender
                     ) => {
-                        show_warn(res);
+                        if let Err(e) = res {
+                            warn!("Connection interrupted: {e:?}");
+                        }
                     },
                     _ = DISCONNECT_CLIENT_NOTIFIER.notified() => (),
                     _ = shutdown_detector => (),
@@ -530,7 +526,6 @@ async fn connection_pipeline(
     mut control_receiver: ControlSocketReceiver<ClientControlPacket>,
     microphone_sample_rate: u32,
     refresh_rate: f32,
-    frame_interval_sender: smpsc::Sender<Duration>,
 ) -> StrResult {
     let control_sender = Arc::new(Mutex::new(control_sender));
 
@@ -570,19 +565,17 @@ async fn connection_pipeline(
     *STATISTICS_MANAGER.lock() = Some(StatisticsManager::new(
         settings.connection.statistics_history_size as _,
         Duration::from_secs_f32(1.0 / refresh_rate),
+        if let Switch::Enabled(config) = &settings.headset.controllers {
+            config.steamvr_pipeline_frames
+        } else {
+            0.0
+        },
     ));
 
     *BITRATE_MANAGER.lock() = BitrateManager::new(
-        settings.video.bitrate,
         settings.connection.statistics_history_size as _,
+        refresh_rate,
     );
-
-    // todo: dynamic framerate
-    frame_interval_sender
-        .send(Duration::from_secs_f32(1.0 / refresh_rate))
-        .ok();
-
-    alvr_events::send_event(EventType::ClientConnected);
 
     {
         let on_connect_script = settings.connection.on_connect_script;
@@ -598,7 +591,7 @@ async fn connection_pipeline(
         }
     }
 
-    if settings.extra.save_video_stream {
+    if settings.capture.save_video_stream {
         crate::create_recording_file();
     }
 
@@ -607,14 +600,13 @@ async fn connection_pipeline(
     let is_streaming = Arc::new(RelaxedAtomic::new(true));
     let _stream_guard = StreamCloseGuard(Arc::clone(&is_streaming));
 
-    let game_audio_loop: BoxFuture<_> = if let Switch::Enabled(desc) = settings.audio.game_audio {
+    let game_audio_loop: BoxFuture<_> = if let Switch::Enabled(config) = settings.audio.game_audio {
         let sender = stream_socket.request_stream(AUDIO).await?;
         Box::pin(async move {
             loop {
-                let device = match AudioDevice::new(
+                let device = match AudioDevice::new_output(
                     Some(settings.audio.linux_backend),
-                    &desc.device_id,
-                    AudioDeviceType::Output,
+                    config.device.as_ref(),
                 ) {
                     Ok(data) => data,
                     Err(e) => {
@@ -623,51 +615,40 @@ async fn connection_pipeline(
                         continue;
                     }
                 };
-                let mute_when_streaming = desc.mute_when_streaming;
+                let mute_when_streaming = config.mute_when_streaming;
 
                 #[cfg(windows)]
-                unsafe {
-                    let device_id = match alvr_audio::get_windows_device_id(&device) {
-                        Ok(data) => data,
-                        Err(_) => continue,
-                    };
-                    crate::SetOpenvrProperty(
-                        *alvr_common::HEAD_ID,
-                        crate::to_ffi_openvr_prop(
-                            alvr_session::OpenvrPropertyKey::AudioDefaultPlaybackDeviceId,
-                            alvr_session::OpenvrPropValue::String(device_id),
-                        ),
-                    )
-                }
-                let new_sender = sender.clone();
-                match alvr_audio::record_audio_loop(device, 2, mute_when_streaming, new_sender)
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(e) => warn!("Audio task exit with error : {e}"),
-                };
-
-                #[cfg(windows)]
-                {
-                    let default_device = match AudioDevice::new(
-                        None,
-                        &alvr_session::AudioDeviceId::Default,
-                        AudioDeviceType::Output,
-                    ) {
-                        Ok(data) => data,
-                        Err(_) => continue,
-                    };
-                    let default_device_id = match alvr_audio::get_windows_device_id(&default_device)
-                    {
-                        Ok(data) => data,
-                        Err(_) => continue,
-                    };
+                if let Ok(id) = alvr_audio::get_windows_device_id(&device) {
                     unsafe {
                         crate::SetOpenvrProperty(
                             *alvr_common::HEAD_ID,
-                            crate::to_ffi_openvr_prop(
+                            crate::openvr_props::to_ffi_openvr_prop(
                                 alvr_session::OpenvrPropertyKey::AudioDefaultPlaybackDeviceId,
-                                alvr_session::OpenvrPropValue::String(default_device_id),
+                                alvr_session::OpenvrPropValue::String(id),
+                            ),
+                        )
+                    }
+                } else {
+                    continue;
+                };
+
+                let new_sender = sender.clone();
+                if let Err(e) =
+                    alvr_audio::record_audio_loop(device, 2, mute_when_streaming, new_sender).await
+                {
+                    warn!("Audio task exit with error : {e}")
+                }
+
+                #[cfg(windows)]
+                if let Ok(id) =
+                    alvr_audio::get_windows_device_id(&AudioDevice::new_output(None, None)?)
+                {
+                    unsafe {
+                        crate::SetOpenvrProperty(
+                            *alvr_common::HEAD_ID,
+                            crate::openvr_props::to_ffi_openvr_prop(
+                                alvr_session::OpenvrPropertyKey::AudioDefaultPlaybackDeviceId,
+                                alvr_session::OpenvrPropValue::String(id),
                             ),
                         )
                     }
@@ -677,40 +658,32 @@ async fn connection_pipeline(
     } else {
         Box::pin(future::pending())
     };
-    let microphone_loop: BoxFuture<_> = if let Switch::Enabled(desc) = settings.audio.microphone {
-        let input_device = AudioDevice::new(
+    let microphone_loop: BoxFuture<_> = if let Switch::Enabled(config) = settings.audio.microphone {
+        #[allow(unused_variables)]
+        let (sink, source) = AudioDevice::new_virtual_microphone_pair(
             Some(settings.audio.linux_backend),
-            &desc.input_device_id,
-            AudioDeviceType::VirtualMicrophoneInput,
+            config.devices,
         )?;
         let receiver = stream_socket.subscribe_to_stream(AUDIO).await?;
 
         #[cfg(windows)]
-        {
-            let microphone_device = AudioDevice::new(
-                None,
-                &desc.output_device_id,
-                AudioDeviceType::VirtualMicrophoneOutput {
-                    matching_input_device_name: input_device.name()?,
-                },
-            )?;
-            let microphone_device_id = alvr_audio::get_windows_device_id(&microphone_device)?;
+        if let Ok(id) = alvr_audio::get_windows_device_id(&source) {
             unsafe {
                 crate::SetOpenvrProperty(
                     *alvr_common::HEAD_ID,
-                    crate::to_ffi_openvr_prop(
+                    crate::openvr_props::to_ffi_openvr_prop(
                         alvr_session::OpenvrPropertyKey::AudioDefaultRecordingDeviceId,
-                        alvr_session::OpenvrPropValue::String(microphone_device_id),
+                        alvr_session::OpenvrPropValue::String(id),
                     ),
                 )
             }
         }
 
         Box::pin(alvr_audio::play_audio_loop(
-            input_device,
+            sink,
             1,
             microphone_sample_rate,
-            desc.buffering_config,
+            config.buffering,
             receiver,
         ))
     } else {
@@ -720,11 +693,12 @@ async fn connection_pipeline(
     let video_send_loop = {
         let mut socket_sender = stream_socket.request_stream(VIDEO).await?;
         async move {
-            let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
+            let (data_sender, mut data_receiver) =
+                tmpsc::channel(settings.connection.max_queued_server_video_frames);
             *VIDEO_SENDER.lock() = Some(data_sender);
 
-            while let Some(VideoPacket { timestamp, payload }) = data_receiver.recv().await {
-                socket_sender.send(&timestamp, payload).await.ok();
+            while let Some(VideoPacket { header, payload }) = data_receiver.recv().await {
+                socket_sender.send(&header, payload).await.ok();
             }
 
             Ok(())
@@ -733,31 +707,41 @@ async fn connection_pipeline(
 
     let haptics_send_loop = {
         let mut socket_sender = stream_socket.request_stream(HAPTICS).await?;
-        let controllers_desc = settings.headset.controllers.clone();
         async move {
             let (data_sender, mut data_receiver) = tmpsc::unbounded_channel();
             *HAPTICS_SENDER.lock() = Some(data_sender);
 
-            let haptics_manager = controllers_desc
-                .into_option()
-                .and_then(|c| c.haptics.into_option())
-                .map(HapticsManager::new);
-
             while let Some(haptics) = data_receiver.recv().await {
-                if settings.extra.log_haptics {
-                    alvr_events::send_event(EventType::Haptics(HapticsEvent {
-                        path: DEVICE_ID_TO_PATH
-                            .get(&haptics.device_id)
-                            .map(|p| (*p).to_owned())
-                            .unwrap_or_else(|| format!("Unknown (ID: {:#16x})", haptics.device_id)),
-                        duration: haptics.duration,
-                        frequency: haptics.frequency,
-                        amplitude: haptics.amplitude,
-                    }))
-                }
+                let haptics_config = {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
 
-                if let Some(manager) = &haptics_manager {
-                    socket_sender.send(&manager.map(haptics), vec![]).await.ok();
+                    if data_manager_lock.settings().logging.log_haptics {
+                        alvr_events::send_event(EventType::Haptics(HapticsEvent {
+                            path: DEVICE_ID_TO_PATH
+                                .get(&haptics.device_id)
+                                .map(|p| (*p).to_owned())
+                                .unwrap_or_else(|| {
+                                    format!("Unknown (ID: {:#16x})", haptics.device_id)
+                                }),
+                            duration: haptics.duration,
+                            frequency: haptics.frequency,
+                            amplitude: haptics.amplitude,
+                        }))
+                    }
+
+                    data_manager_lock
+                        .settings()
+                        .headset
+                        .controllers
+                        .as_option()
+                        .and_then(|c| c.haptics.as_option().cloned())
+                };
+
+                if let Some(config) = haptics_config {
+                    socket_sender
+                        .send(&haptics::map_haptics(&config, haptics), vec![])
+                        .await
+                        .ok();
                 }
             }
 
@@ -781,50 +765,113 @@ async fn connection_pipeline(
         });
     }
 
-    let tracking_manager = Arc::new(Mutex::new(TrackingManager::new(&settings.headset)));
+    let tracking_manager = Arc::new(Mutex::new(TrackingManager::new()));
 
     let tracking_receive_loop = {
         let mut receiver = stream_socket
             .subscribe_to_stream::<Tracking>(TRACKING)
             .await?;
-        let control_sender = Arc::clone(&control_sender);
         let tracking_manager = Arc::clone(&tracking_manager);
         async move {
-            let tracking_latency_offset_s =
-                if let Switch::Enabled(controllers) = &settings.headset.controllers {
-                    controllers.pose_time_offset_ms
-                } else {
-                    0
-                } as f32
-                    / 1000.;
+            let face_tracking_sink = if let Switch::Enabled(config) = settings.headset.face_tracking
+            {
+                Some(FaceTrackingSink::new(
+                    config.sink,
+                    settings.connection.osc_local_port,
+                )?)
+            } else {
+                None
+            };
+
+            let mut track_controllers = 0u32;
+            if let Switch::Enabled(config) = settings.headset.controllers {
+                track_controllers = config.tracked.into();
+            }
+
             loop {
                 let tracking = receiver.recv_header_only().await?;
 
                 let mut tracking_manager_lock = tracking_manager.lock().await;
 
-                let ffi_motions = tracking_manager_lock.transform_motions(
-                    &tracking.device_motions,
-                    tracking.left_hand_skeleton.is_some(),
-                    tracking.right_hand_skeleton.is_some(),
-                );
+                let motions;
+                let left_hand_skeleton;
+                let right_hand_skeleton;
+                {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
+                    let config = &data_manager_lock.settings().headset;
+                    motions = tracking_manager_lock.transform_motions(
+                        config,
+                        &tracking.device_motions,
+                        [
+                            tracking.hand_skeletons[0].is_some(),
+                            tracking.hand_skeletons[1].is_some(),
+                        ],
+                    );
 
-                let ffi_left_hand_skeleton = tracking
-                    .left_hand_skeleton
-                    .map(|s| tracking_manager_lock.to_openvr_hand_skeleton(*LEFT_HAND_ID, s));
-                let ffi_right_hand_skeleton = tracking
-                    .right_hand_skeleton
-                    .map(|s| tracking_manager_lock.to_openvr_hand_skeleton(*RIGHT_HAND_ID, s));
+                    left_hand_skeleton = tracking.hand_skeletons[0]
+                        .map(|s| tracking::to_openvr_hand_skeleton(config, *LEFT_HAND_ID, s));
+                    right_hand_skeleton = tracking.hand_skeletons[1]
+                        .map(|s| tracking::to_openvr_hand_skeleton(config, *RIGHT_HAND_ID, s));
+                }
+
+                // Note: using the raw unrecentered head
+                let local_eye_gazes = tracking
+                    .device_motions
+                    .iter()
+                    .find(|(id, _)| *id == *HEAD_ID)
+                    .map(|(_, m)| tracking::to_local_eyes(m.pose, tracking.face_data.eye_gazes))
+                    .unwrap_or_default();
+
+                {
+                    let data_manager_lock = SERVER_DATA_MANAGER.read();
+                    if data_manager_lock.settings().logging.log_tracking {
+                        alvr_events::send_event(EventType::Tracking(Box::new(TrackingEvent {
+                            head_motion: motions
+                                .iter()
+                                .find(|(id, _)| *id == *HEAD_ID)
+                                .map(|(_, m)| *m),
+                            controller_motions: [
+                                motions
+                                    .iter()
+                                    .find(|(id, _)| *id == *LEFT_HAND_ID)
+                                    .map(|(_, m)| *m),
+                                motions
+                                    .iter()
+                                    .find(|(id, _)| *id == *RIGHT_HAND_ID)
+                                    .map(|(_, m)| *m),
+                            ],
+                            hand_skeletons: [left_hand_skeleton, right_hand_skeleton],
+                            eye_gazes: local_eye_gazes,
+                            fb_face_expression: tracking.face_data.fb_face_expression.clone(),
+                            htc_eye_expression: tracking.face_data.htc_eye_expression.clone(),
+                            htc_lip_expression: tracking.face_data.htc_lip_expression.clone(),
+                        })))
+                    }
+                }
+
+                if let Some(sink) = &face_tracking_sink {
+                    let mut face_data = tracking.face_data;
+                    face_data.eye_gazes = local_eye_gazes;
+
+                    sink.send_tracking(face_data);
+                }
+
+                let ffi_motions = motions
+                    .into_iter()
+                    .map(|(id, motion)| tracking::to_ffi_motion(id, motion))
+                    .collect::<Vec<_>>();
+                let ffi_left_hand_skeleton = left_hand_skeleton.map(tracking::to_ffi_skeleton);
+                let ffi_right_hand_skeleton = right_hand_skeleton.map(tracking::to_ffi_skeleton);
 
                 drop(tracking_manager_lock);
 
-                let server_prediction_average = if let Some(stats) = &mut *STATISTICS_MANAGER.lock()
-                {
+                if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
                     stats.report_tracking_received(tracking.target_timestamp);
 
                     unsafe {
                         crate::SetTracking(
                             tracking.target_timestamp.as_nanos() as _,
-                            tracking_latency_offset_s,
+                            stats.tracker_pose_time_offset().as_secs_f32(),
                             ffi_motions.as_ptr(),
                             ffi_motions.len() as _,
                             if let Some(skeleton) = &ffi_left_hand_skeleton {
@@ -837,22 +884,10 @@ async fn connection_pipeline(
                             } else {
                                 ptr::null()
                             },
+                            track_controllers,
                         )
                     };
-
-                    stats.get_server_prediction_average()
-                } else {
-                    Duration::ZERO
-                };
-
-                control_sender
-                    .lock()
-                    .await
-                    .send(&ServerControlPacket::ServerPredictionAverage(
-                        server_prediction_average,
-                    ))
-                    .await
-                    .ok();
+                }
             }
         }
     };
@@ -871,6 +906,7 @@ async fn connection_pipeline(
                     let network_latency = stats.report_statistics(client_stats);
 
                     BITRATE_MANAGER.lock().report_frame_latencies(
+                        &SERVER_DATA_MANAGER.read().settings().video.bitrate.mode,
                         timestamp,
                         network_latency,
                         decoder_latency,
@@ -890,7 +926,6 @@ async fn connection_pipeline(
                     .send(&ServerControlPacket::KeepAlive)
                     .await;
                 if let Err(e) = res {
-                    alvr_events::send_event(EventType::ClientDisconnected);
                     info!("Client disconnected. Cause: {e}");
                     break Ok(());
                 }
@@ -920,16 +955,19 @@ async fn connection_pipeline(
                     if !is_tracking_ref_only {
                         playspace_sync_sender.send(packet).ok();
 
-                        tracking_manager.lock().await.recenter();
+                        let data_manager_lock = SERVER_DATA_MANAGER.read();
+                        let config = &data_manager_lock.settings().headset;
+                        tracking_manager.lock().await.recenter(
+                            config.position_recentering_mode,
+                            config.rotation_recentering_mode,
+                        );
                     }
                 }
                 Ok(ClientControlPacket::RequestIdr) => {
                     if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-                        if let Some(config_buffer) = &*DECODER_CONFIG.lock() {
+                        if let Some(config) = &*DECODER_CONFIG.lock() {
                             sender
-                                .send(ServerControlPacket::InitializeDecoder {
-                                    config_buffer: config_buffer.clone(),
-                                })
+                                .send(ServerControlPacket::InitializeDecoder(config.clone()))
                                 .ok();
                         }
                     }
@@ -967,37 +1005,52 @@ async fn connection_pipeline(
                         stats.report_battery(packet.device_id, packet.gauge_value);
                     }
                 },
-                Ok(ClientControlPacket::Button { path_id, value }) => {
-                    if settings.extra.log_button_presses {
-                        alvr_events::send_event(EventType::Button(ButtonEvent {
-                            path: BUTTON_PATH_FROM_ID
-                                .get(&path_id)
-                                .cloned()
-                                .unwrap_or_else(|| format!("Unknown (ID: {path_id:#16x})")),
-                            value,
-                        }));
+                Ok(ClientControlPacket::Buttons(entries)) => {
+                    {
+                        let data_manager_lock = SERVER_DATA_MANAGER.read();
+                        if data_manager_lock.settings().logging.log_button_presses {
+                            alvr_events::send_event(EventType::Buttons(
+                                entries
+                                    .iter()
+                                    .map(|e| ButtonEvent {
+                                        path: BUTTON_PATH_FROM_ID
+                                            .get(&e.path_id)
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                format!("Unknown (ID: {:#16x})", e.path_id)
+                                            }),
+                                        value: e.value,
+                                    })
+                                    .collect(),
+                            ));
+                        }
                     }
 
-                    let value = match value {
-                        ButtonValue::Binary(value) => FfiButtonValue {
-                            type_: crate::FfiButtonType_BUTTON_TYPE_BINARY,
-                            __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 { binary: value },
-                        },
+                    for entry in entries {
+                        let value = match entry.value {
+                            ButtonValue::Binary(value) => FfiButtonValue {
+                                type_: crate::FfiButtonType_BUTTON_TYPE_BINARY,
+                                __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
+                                    binary: value.into(),
+                                },
+                            },
 
-                        ButtonValue::Scalar(value) => FfiButtonValue {
-                            type_: crate::FfiButtonType_BUTTON_TYPE_SCALAR,
-                            __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 { scalar: value },
-                        },
-                    };
+                            ButtonValue::Scalar(value) => FfiButtonValue {
+                                type_: crate::FfiButtonType_BUTTON_TYPE_SCALAR,
+                                __bindgen_anon_1: crate::FfiButtonValue__bindgen_ty_1 {
+                                    scalar: value,
+                                },
+                            },
+                        };
 
-                    unsafe { crate::SetButton(path_id, value) };
+                        unsafe { crate::SetButton(entry.path_id, value) };
+                    }
                 }
                 Ok(ClientControlPacket::Log { level, message }) => {
                     info!("Client {client_hostname}: [{level:?}] {message}")
                 }
                 Ok(_) => (),
                 Err(e) => {
-                    alvr_events::send_event(EventType::ClientDisconnected);
                     info!("Client disconnected. Cause: {e}");
                     break;
                 }
@@ -1012,7 +1065,6 @@ async fn connection_pipeline(
     tokio::select! {
         // Spawn new tasks and let the runtime manage threading
         res = spawn_cancelable(receive_loop) => {
-            alvr_events::send_event(EventType::ClientDisconnected);
             if let Err(e) = res {
                 info!("Client disconnected. Cause: {e}" );
             }

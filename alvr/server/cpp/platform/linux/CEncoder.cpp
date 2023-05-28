@@ -87,7 +87,7 @@ void av_logfn(void*, int level, const char* data, va_list va)
 #ifdef DEBUG
           AV_LOG_DEBUG)
 #else
-          AV_LOG_VERBOSE)
+          AV_LOG_INFO)
 #endif
     return;
 
@@ -263,7 +263,7 @@ void CEncoder::Run() {
           auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
           composed_offset = now - encode_timestamp.cpu;
         } else {
-          Error("Invalid encoder timestamp!");
+          composed_offset = render_timestamps.now - render_timestamps.renderComplete;
         }
 
         if (present_offset < composed_offset) {
@@ -273,7 +273,7 @@ void CEncoder::Run() {
         ReportPresent(pose->targetTimestampNs, present_offset);
         ReportComposed(pose->targetTimestampNs, composed_offset);
 
-        ParseFrameNals(packet.data, packet.size, packet.pts);
+        ParseFrameNals(encode_pipeline->GetCodec(), packet.data, packet.size, packet.pts, packet.isIDR);
       }
     }
     catch (std::exception &e) {

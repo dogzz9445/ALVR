@@ -144,11 +144,6 @@ void OvrDirectModeComponent::SubmitLayer(const SubmitLayerPerEye_t(&perEye)[2])
 		Warn("Too many layers submitted!\n");
 	}
 
-	if (Settings::Instance().m_DriverTestMode & 8) {
-		// Crash test
-		*(char*)0 = 1;
-	}
-
 	//CopyTexture();
 }
 
@@ -210,6 +205,10 @@ void OvrDirectModeComponent::Present(vr::SharedTextureHandle_t syncTexture)
 	}
 }
 
+void OvrDirectModeComponent::PostPresent() {
+	WaitForVSync();
+}
+
 void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
 
 	uint64_t presentationTime = GetTimestampUs();
@@ -260,7 +259,7 @@ void OvrDirectModeComponent::CopyTexture(uint32_t layerCount) {
 
 		std::string debugText;
 
-		uint64_t submitFrameIndex = m_targetTimestampNs + Settings::Instance().m_trackingFrameOffset;
+		uint64_t submitFrameIndex = m_targetTimestampNs;
 
 		// Copy entire texture to staging so we can read the pixels to send to remote device.
 		m_pEncoder->CopyToStaging(pTexture, bounds, layerCount,false, presentationTime, submitFrameIndex,"", debugText);

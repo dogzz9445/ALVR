@@ -1,8 +1,7 @@
 #![allow(unused_variables)]
 
-use alvr_common::{glam::UVec2, Fov};
+use alvr_common::{glam::UVec2, Fov, Pose};
 use alvr_session::FoveatedRenderingDesc;
-use alvr_sockets::Pose;
 use glyph_brush_layout::{
     ab_glyph::{Font, FontRef, ScaleFont},
     FontId, GlyphPositioner, HorizontalAlign, Layout, SectionGeometry, SectionText, VerticalAlign,
@@ -83,7 +82,7 @@ pub fn start_stream(
                 swapchain_textures[1].as_ptr(),
             ],
             swapchainLength: swapchain_textures[0].len() as _,
-            enableFoveation: foveated_rendering.is_some(),
+            enableFoveation: foveated_rendering.is_some().into(),
             foveationCenterSizeX: foveated_rendering
                 .as_ref()
                 .map(|f| f.center_size_x)

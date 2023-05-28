@@ -1,6 +1,6 @@
 use alvr_common::{SlidingWindowAverage, HEAD_ID, LEFT_HAND_ID, RIGHT_HAND_ID};
 use alvr_events::{EventType, GraphStatistics, Statistics};
-use alvr_sockets::ClientStatistics;
+use alvr_packets::ClientStatistics;
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
@@ -34,7 +34,6 @@ impl Default for HistoryFrame {
 pub struct StatisticsManager {
     history_buffer: VecDeque<HistoryFrame>,
     max_history_size: usize,
-    nominal_server_frame_interval: Duration,
     last_full_report_instant: Instant,
     last_frame_present_instant: Instant,
     last_frame_present_interval: Duration,
@@ -45,16 +44,22 @@ pub struct StatisticsManager {
     packets_lost_total: usize,
     packets_lost_partial_sum: usize,
     battery_gauges: HashMap<u64, f32>,
-    game_render_latency_average: SlidingWindowAverage<Duration>,
+    steamvr_pipeline_latency: Duration,
+    total_pipeline_latency_average: SlidingWindowAverage<Duration>,
+    last_vsync_time: Instant,
+    frame_interval: Duration,
 }
 
 impl StatisticsManager {
     // history size used to calculate average total pipeline latency
-    pub fn new(history_size: usize, nominal_server_frame_interval: Duration) -> Self {
+    pub fn new(
+        max_history_size: usize,
+        nominal_server_frame_interval: Duration,
+        steamvr_pipeline_frames: f32,
+    ) -> Self {
         Self {
             history_buffer: VecDeque::new(),
-            max_history_size: history_size,
-            nominal_server_frame_interval,
+            max_history_size,
             last_full_report_instant: Instant::now(),
             last_frame_present_instant: Instant::now(),
             last_frame_present_interval: Duration::ZERO,
@@ -65,7 +70,15 @@ impl StatisticsManager {
             packets_lost_total: 0,
             packets_lost_partial_sum: 0,
             battery_gauges: HashMap::new(),
-            game_render_latency_average: SlidingWindowAverage::new(Duration::ZERO, history_size),
+            steamvr_pipeline_latency: Duration::from_secs_f32(
+                steamvr_pipeline_frames * nominal_server_frame_interval.as_secs_f32(),
+            ),
+            total_pipeline_latency_average: SlidingWindowAverage::new(
+                Duration::ZERO,
+                max_history_size,
+            ),
+            last_vsync_time: Instant::now(),
+            frame_interval: nominal_server_frame_interval,
         }
     }
 
@@ -152,8 +165,6 @@ impl StatisticsManager {
             let game_time_latency = frame
                 .frame_present
                 .saturating_duration_since(frame.tracking_received);
-            self.game_render_latency_average
-                .submit_sample(game_time_latency);
 
             let server_compositor_latency = frame
                 .frame_composed
@@ -258,9 +269,21 @@ impl StatisticsManager {
         }
     }
 
-    // Used for controllers/trackers prediction calculation. The head prediction uses a different
-    // pathway
-    pub fn get_server_prediction_average(&self) -> Duration {
-        self.game_render_latency_average.get_average() + self.nominal_server_frame_interval
+    pub fn tracker_pose_time_offset(&self) -> Duration {
+        // This is the opposite of the client's StatisticsManager::tracker_prediction_offset().
+        self.steamvr_pipeline_latency
+            .saturating_sub(self.total_pipeline_latency_average.get_average())
+    }
+
+    // NB: this call is non-blocking, waiting should be done externally
+    pub fn duration_until_next_vsync(&mut self) -> Duration {
+        let now = Instant::now();
+
+        // update the last vsync if it's too old
+        while self.last_vsync_time + self.frame_interval < now {
+            self.last_vsync_time += self.frame_interval;
+        }
+
+        (self.last_vsync_time + self.frame_interval).saturating_duration_since(now)
     }
 }

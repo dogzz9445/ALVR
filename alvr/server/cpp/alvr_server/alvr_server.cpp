@@ -74,35 +74,33 @@ class DriverProvider : public vr::IServerTrackedDeviceProvider {
         InitDriverLog(vr::VRDriverLog());
 
         this->hmd = std::make_unique<Hmd>();
-        if (vr::VRServerDriverHost()->TrackedDeviceAdded(this->hmd->GetSerialNumber().c_str(),
+        this->tracked_devices.insert({HEAD_ID, (TrackedDevice *)this->hmd.get()});
+        if (vr::VRServerDriverHost()->TrackedDeviceAdded(this->hmd->get_serial_number().c_str(),
                                                          this->hmd->GetDeviceClass(),
                                                          this->hmd.get())) {
-            this->tracked_devices.insert({HEAD_ID, (TrackedDevice *)this->hmd.get()});
         } else {
-            Warn("Failed to HMD device");
+            Warn("Failed to register HMD device");
         }
 
-        if (!Settings::Instance().m_disableController) {
+        if (Settings::Instance().m_enableControllers) {
             this->left_controller = std::make_unique<Controller>(LEFT_HAND_ID);
             this->right_controller = std::make_unique<Controller>(RIGHT_HAND_ID);
 
-            if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
-                    this->left_controller->GetSerialNumber().c_str(),
-                    this->left_controller->getControllerDeviceClass(),
-                    this->left_controller.get())) {
-                this->tracked_devices.insert(
-                    {LEFT_HAND_ID, (TrackedDevice *)this->left_controller.get()});
-            } else {
-                Warn("Failed to register left controller");
-            }
+            this->tracked_devices.insert(
+                {LEFT_HAND_ID, (TrackedDevice *)this->left_controller.get()});
+            this->tracked_devices.insert(
+                {RIGHT_HAND_ID, (TrackedDevice *)this->right_controller.get()});
 
             if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
-                    this->right_controller->GetSerialNumber().c_str(),
+                    this->left_controller->get_serial_number().c_str(),
+                    this->left_controller->getControllerDeviceClass(),
+                    this->left_controller.get())) {
+                Warn("Failed to register left controller");
+            }
+            if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
+                    this->right_controller->get_serial_number().c_str(),
                     this->right_controller->getControllerDeviceClass(),
                     this->right_controller.get())) {
-                this->tracked_devices.insert(
-                    {RIGHT_HAND_ID, (TrackedDevice *)this->right_controller.get()});
-            } else {
                 Warn("Failed to register right controller");
             }
         }
@@ -167,14 +165,12 @@ unsigned int COMPRESS_AXIS_ALIGNED_CSO_LEN;
 const unsigned char *COLOR_CORRECTION_CSO_PTR;
 unsigned int COLOR_CORRECTION_CSO_LEN;
 
-const unsigned char *QUAD_SHADER_VERT_SPV_PTR;
-unsigned int QUAD_SHADER_VERT_SPV_LEN;
-const unsigned char *QUAD_SHADER_FRAG_SPV_PTR;
-unsigned int QUAD_SHADER_FRAG_SPV_LEN;
-const unsigned char *COLOR_SHADER_FRAG_SPV_PTR;
-unsigned int COLOR_SHADER_FRAG_SPV_LEN;
-const unsigned char *FFR_SHADER_FRAG_SPV_PTR;
-unsigned int FFR_SHADER_FRAG_SPV_LEN;
+const unsigned char *QUAD_SHADER_COMP_SPV_PTR;
+unsigned int QUAD_SHADER_COMP_SPV_LEN;
+const unsigned char *COLOR_SHADER_COMP_SPV_PTR;
+unsigned int COLOR_SHADER_COMP_SPV_LEN;
+const unsigned char *FFR_SHADER_COMP_SPV_PTR;
+unsigned int FFR_SHADER_COMP_SPV_LEN;
 const unsigned char *RGBTOYUV420_SHADER_COMP_SPV_PTR;
 unsigned int RGBTOYUV420_SHADER_COMP_SPV_LEN;
 
@@ -187,8 +183,8 @@ void (*LogInfo)(const char *stringPtr);
 void (*LogDebug)(const char *stringPtr);
 void (*LogPeriodically)(const char *tag, const char *stringPtr);
 void (*DriverReadyIdle)(bool setDefaultChaprone);
-void (*InitializeDecoder)(const unsigned char *configBuffer, int len);
-void (*VideoSend)(unsigned long long targetTimestampNs, unsigned char *buf, int len);
+void (*InitializeDecoder)(const unsigned char *configBuffer, int len, int codec);
+void (*VideoSend)(unsigned long long targetTimestampNs, unsigned char *buf, int len, bool isIdr);
 void (*HapticsSend)(unsigned long long path, float duration_s, float frequency, float amplitude);
 void (*ShutdownRuntime)();
 unsigned long long (*PathStringToHash)(const char *path);
@@ -196,6 +192,9 @@ void (*ReportPresent)(unsigned long long timestamp_ns, unsigned long long offset
 void (*ReportComposed)(unsigned long long timestamp_ns, unsigned long long offset_ns);
 void (*ReportEncoded)(unsigned long long timestamp_ns);
 FfiDynamicEncoderParams (*GetDynamicEncoderParams)();
+unsigned long long (*GetSerialNumber)(unsigned long long deviceID, char *outString);
+void (*SetOpenvrProps)(unsigned long long deviceID);
+void (*WaitForVSync)();
 
 void *CppEntryPoint(const char *interface_name, int *return_code) {
     // Initialize path constants
@@ -228,13 +227,7 @@ void DeinitializeStreaming() {
     }
 }
 
-void SendVSync(float frameIntervalS) {
-    vr::Compositor_FrameTiming timings = {sizeof(vr::Compositor_FrameTiming)};
-    vr::VRServerDriverHost()->GetFrameTimings(&timings, 1);
-
-    // Warning: if the vsync offset deviates too much from 0, the latency starts to increase.
-    vr::VRServerDriverHost()->VsyncEvent(-frameIntervalS * timings.m_nNumVSyncsReadyForUse);
-}
+void SendVSync() { vr::VRServerDriverHost()->VsyncEvent(0.0); }
 
 void RequestIDR() {
     if (g_driver_provider.hmd && g_driver_provider.hmd->m_encoder) {
@@ -247,18 +240,19 @@ void SetTracking(unsigned long long targetTimestampNs,
                  const FfiDeviceMotion *deviceMotions,
                  int motionsCount,
                  const FfiHandSkeleton *leftHand,
-                 const FfiHandSkeleton *rightHand) {
+                 const FfiHandSkeleton *rightHand,
+                 unsigned int controllersTracked) {
     for (int i = 0; i < motionsCount; i++) {
         if (deviceMotions[i].deviceID == HEAD_ID && g_driver_provider.hmd) {
             g_driver_provider.hmd->OnPoseUpdated(targetTimestampNs, deviceMotions[i]);
         } else {
             if (g_driver_provider.left_controller && deviceMotions[i].deviceID == LEFT_HAND_ID) {
                 g_driver_provider.left_controller->onPoseUpdate(
-                    controllerPoseTimeOffsetS, deviceMotions[i], leftHand);
+                    controllerPoseTimeOffsetS, deviceMotions[i], leftHand, controllersTracked);
             } else if (g_driver_provider.right_controller &&
                        deviceMotions[i].deviceID == RIGHT_HAND_ID) {
                 g_driver_provider.right_controller->onPoseUpdate(
-                    controllerPoseTimeOffsetS, deviceMotions[i], rightHand);
+                    controllerPoseTimeOffsetS, deviceMotions[i], rightHand, controllersTracked);
             }
         }
     }
@@ -277,8 +271,8 @@ void ShutdownSteamvr() {
     }
 }
 
-void SetOpenvrProperty(unsigned long long top_level_path, FfiOpenvrProperty prop) {
-    auto device_it = g_driver_provider.tracked_devices.find(top_level_path);
+void SetOpenvrProperty(unsigned long long deviceID, FfiOpenvrProperty prop) {
+    auto device_it = g_driver_provider.tracked_devices.find(deviceID);
 
     if (device_it != g_driver_provider.tracked_devices.end()) {
         device_it->second->set_prop(prop);
@@ -291,8 +285,8 @@ void SetViewsConfig(FfiViewsConfig config) {
     }
 }
 
-void SetBattery(unsigned long long top_level_path, float gauge_value, bool is_plugged) {
-    auto device_it = g_driver_provider.tracked_devices.find(top_level_path);
+void SetBattery(unsigned long long deviceID, float gauge_value, bool is_plugged) {
+    auto device_it = g_driver_provider.tracked_devices.find(deviceID);
 
     if (device_it != g_driver_provider.tracked_devices.end()) {
         vr::VRProperties()->SetFloatProperty(

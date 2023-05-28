@@ -104,14 +104,14 @@ pub fn build_ffmpeg_linux(nvenc_flag: bool) {
     let download_path = afs::deps_dir().join("linux");
     command::download_and_extract_zip(
         &sh,
-        "https://codeload.github.com/FFmpeg/FFmpeg/zip/n5.1",
+        "https://codeload.github.com/FFmpeg/FFmpeg/zip/n6.0",
         &download_path,
     )
     .unwrap();
 
     let final_path = download_path.join("ffmpeg");
 
-    fs::rename(download_path.join("FFmpeg-n5.1"), &final_path).unwrap();
+    fs::rename(download_path.join("FFmpeg-n6.0"), &final_path).unwrap();
 
     let flags = [
         "--enable-gpl",
@@ -123,21 +123,16 @@ pub fn build_ffmpeg_linux(nvenc_flag: bool) {
         "--disable-avdevice",
         "--disable-avformat",
         "--disable-swresample",
+        "--disable-swscale",
         "--disable-postproc",
         "--disable-network",
         "--enable-lto",
         "--disable-everything",
         "--enable-encoder=h264_vaapi",
         "--enable-encoder=hevc_vaapi",
-        "--enable-encoder=libx264",
-        "--enable-encoder=libx264rgb",
-        // "--enable-encoder=libx265",
         "--enable-hwaccel=h264_vaapi",
         "--enable-hwaccel=hevc_vaapi",
-        "--enable-filter=scale",
         "--enable-filter=scale_vaapi",
-        "--enable-libx264",
-        // "--enable-libx265",
         "--enable-vulkan",
         "--enable-libdrm",
         "--enable-pic",
@@ -227,7 +222,7 @@ fn get_android_openxr_loaders() {
         &sh,
         &format!(
             "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/{}",
-            "release-1.0.26/openxr_loader_for_android-1.0.26.aar",
+            "release-1.0.27/openxr_loader_for_android-1.0.27.aar",
         ),
         &temp_dir,
     )
@@ -242,7 +237,7 @@ fn get_android_openxr_loaders() {
     // Quest
     command::download_and_extract_zip(
         &sh,
-        "https://securecdn.oculus.com/binaries/download/?id=5860257274012811",
+        "https://securecdn.oculus.com/binaries/download/?id=6316350341736833", // version 53
         &temp_dir,
     )
     .unwrap();
@@ -256,7 +251,7 @@ fn get_android_openxr_loaders() {
     // Pico
     command::download_and_extract_zip(
         &sh,
-        "https://sdk.picovr.com/developer-platform/sdk/Pico_OpenXR_SDK_v210.zip",
+        "https://sdk.picovr.com/developer-platform/sdk/PICO_OpenXR_SDK_220.zip",
         &temp_dir,
     )
     .unwrap();
@@ -291,6 +286,15 @@ pub fn build_android_deps(skip_admin_priv: bool) {
     }
 
     cmd!(sh, "rustup target add aarch64-linux-android")
+        .run()
+        .unwrap();
+    cmd!(sh, "rustup target add armv7-linux-androideabi")
+        .run()
+        .unwrap();
+    cmd!(sh, "rustup target add x86_64-linux-android")
+        .run()
+        .unwrap();
+    cmd!(sh, "rustup target add i686-linux-android")
         .run()
         .unwrap();
     cmd!(sh, "cargo install cargo-apk cargo-ndk cbindgen")

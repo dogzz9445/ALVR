@@ -80,5 +80,11 @@ bool alvr::EncodePipeline::GetEncoded(FramePacket &packet)
   packet.data = encoder_packet->data;
   packet.size = encoder_packet->size;
   packet.pts = encoder_packet->pts;
+  packet.isIDR = encoder_packet->flags & AV_PKT_FLAG_KEY != 0;
   return true;
+}
+
+int alvr::EncodePipeline::GetCodec()
+{
+  return Settings::Instance().m_codec;
 }

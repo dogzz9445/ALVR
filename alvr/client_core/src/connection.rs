@@ -9,17 +9,19 @@ use crate::{
     ClientCoreEvent, CONTROL_CHANNEL_SENDER, DISCONNECT_NOTIFIER, EVENT_QUEUE, IS_ALIVE,
     IS_RESUMED, IS_STREAMING, STATISTICS_MANAGER, STATISTICS_SENDER, TRACKING_SENDER,
 };
-use alvr_audio::{AudioDevice, AudioDeviceType};
+use alvr_audio::AudioDevice;
 use alvr_common::{glam::UVec2, prelude::*, ALVR_VERSION, HEAD_ID};
-use alvr_session::{AudioDeviceId, SessionDesc};
+use alvr_packets::{
+    BatteryPacket, ClientConnectionResult, ClientControlPacket, Haptics, ServerControlPacket,
+    StreamConfigPacket, VideoPacketHeader, VideoStreamingCapabilities, AUDIO, HAPTICS, STATISTICS,
+    TRACKING, VIDEO,
+};
+use alvr_session::{settings_schema::Switch, SessionDesc};
 use alvr_sockets::{
-    spawn_cancelable, BatteryPacket, ClientConnectionResult, ClientControlPacket, Haptics,
-    PeerType, ProtoControlSocket, ReceiverBuffer, ServerControlPacket, StreamConfigPacket,
-    StreamSocketBuilder, VideoStreamingCapabilities, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
+    spawn_cancelable, PeerType, ProtoControlSocket, ReceiverBuffer, StreamSocketBuilder,
 };
 use futures::future::BoxFuture;
 use serde_json as json;
-use settings_schema::Switch;
 use std::{
     future,
     net::IpAddr,
@@ -39,20 +41,20 @@ use crate::audio;
 use alvr_audio as audio;
 
 const INITIAL_MESSAGE: &str = concat!(
-    "Searching for server...\n",
+    "Searching for streamer...\n",
     "Open ALVR on your PC then click \"Trust\"\n",
     "next to the client entry",
 );
 const NETWORK_UNREACHABLE_MESSAGE: &str = "Cannot connect to the internet";
 // const INCOMPATIBLE_VERSIONS_MESSAGE: &str = concat!(
-//     "Server and client have\n",
+//     "Streamer and client have\n",
 //     "incompatible types.\n",
 //     "Please update either the app\n",
 //     "on the PC or on the headset",
 // );
 const STREAM_STARTING_MESSAGE: &str = "The stream will begin soon\nPlease wait...";
-const SERVER_RESTART_MESSAGE: &str = "The server is restarting\nPlease wait...";
-const SERVER_DISCONNECTED_MESSAGE: &str = "The server has disconnected.";
+const SERVER_RESTART_MESSAGE: &str = "The streamer is restarting\nPlease wait...";
+const SERVER_DISCONNECTED_MESSAGE: &str = "The streamer has disconnected.";
 
 const DISCOVERY_RETRY_PAUSE: Duration = Duration::from_millis(500);
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -150,15 +152,15 @@ fn connection_pipeline(
         }
     };
 
-    let microphone_sample_rate =
-        AudioDevice::new(None, &AudioDeviceId::Default, AudioDeviceType::Input)
-            .unwrap()
-            .input_sample_rate()
-            .unwrap();
+    let microphone_sample_rate = AudioDevice::new_input(None)
+        .unwrap()
+        .input_sample_rate()
+        .unwrap();
 
     runtime
         .block_on(
             proto_control_socket.send(&ClientConnectionResult::ConnectionAccepted {
+                client_protocol_id: alvr_common::protocol_id(),
                 display_name: platform::device_model(),
                 server_ip,
                 streaming_capabilities: Some(VideoStreamingCapabilities {
@@ -189,6 +191,19 @@ async fn stream_pipeline(
     server_ip: IpAddr,
     decoder_guard: Arc<Mutex<()>>,
 ) -> StrResult {
+    let settings = {
+        let mut session_desc = SessionDesc::default();
+        session_desc
+            .merge_from_json(&json::from_str(&stream_config.session_desc).map_err(err!())?)?;
+        session_desc.to_settings()
+    };
+
+    let streaming_start_event = ClientCoreEvent::StreamingStarted {
+        view_resolution: stream_config.view_resolution,
+        refresh_rate_hint: stream_config.fps,
+        settings: Box::new(settings.clone()),
+    };
+
     let (control_sender, mut control_receiver) = proto_socket.split();
     let control_sender = Arc::new(Mutex::new(control_sender));
 
@@ -214,15 +229,14 @@ async fn stream_pipeline(
         }
     }
 
-    let settings = {
-        let mut session_desc = SessionDesc::default();
-        session_desc
-            .merge_from_json(&json::from_str(&stream_config.session_desc).map_err(err!())?)?;
-        session_desc.to_settings()
-    };
-
     *STATISTICS_MANAGER.lock() = Some(StatisticsManager::new(
         settings.connection.statistics_history_size as _,
+        Duration::from_secs_f32(1.0 / stream_config.fps),
+        if let Switch::Enabled(config) = settings.headset.controllers {
+            config.steamvr_pipeline_frames
+        } else {
+            0.0
+        },
     ));
 
     let stream_socket_builder = StreamSocketBuilder::listen_for_server(
@@ -265,13 +279,9 @@ async fn stream_pipeline(
     {
         let config = &mut *DECODER_INIT_CONFIG.lock();
 
-        config.codec = settings.video.codec;
         config.max_buffering_frames = settings.video.max_buffering_frames;
         config.buffering_history_weight = settings.video.buffering_history_weight;
-        config.options = settings
-            .video
-            .advanced_codec_options
-            .mediacodec_extra_options;
+        config.options = settings.video.mediacodec_extra_options;
     }
 
     let tracking_send_loop = {
@@ -311,20 +321,12 @@ async fn stream_pipeline(
         }
     };
 
-    let streaming_start_event = ClientCoreEvent::StreamingStarted {
-        view_resolution: stream_config.view_resolution,
-        fps: stream_config.fps,
-        foveated_rendering: settings.video.foveated_rendering.into_option(),
-        oculus_foveation_level: settings.video.oculus_foveation_level,
-        dynamic_oculus_foveation: settings.video.dynamic_oculus_foveation,
-        extra_latency: settings.headset.extra_latency_mode,
-    };
-
     IS_STREAMING.set(true);
 
     let video_receive_loop = {
-        let mut receiver = stream_socket.subscribe_to_stream::<Duration>(VIDEO).await?;
-        let disconnection_critera = settings.connection.disconnection_criteria;
+        let mut receiver = stream_socket
+            .subscribe_to_stream::<VideoPacketHeader>(VIDEO)
+            .await?;
         async move {
             let _decoder_guard = decoder_guard.lock().await;
 
@@ -352,45 +354,39 @@ async fn stream_pipeline(
             EVENT_QUEUE.lock().push_back(streaming_start_event);
 
             let mut receiver_buffer = ReceiverBuffer::new();
-            let mut disconnection_timer_begin = None;
+            let mut stream_corrupted = false;
             loop {
                 receiver.recv_buffer(&mut receiver_buffer).await?;
-                let (timestamp, nal) = receiver_buffer.get()?;
+                let (header, nal) = receiver_buffer.get()?;
 
                 if !IS_RESUMED.value() {
                     break Ok(());
                 }
 
                 if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-                    stats.report_video_packet_received(timestamp);
+                    stats.report_video_packet_received(header.timestamp);
                 }
 
-                decoder::push_nal(timestamp, nal);
-
-                if receiver_buffer.had_packet_loss() {
+                if header.is_idr {
+                    stream_corrupted = false;
+                } else if receiver_buffer.had_packet_loss() {
+                    stream_corrupted = true;
                     if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-                        sender.send(ClientControlPacket::VideoErrorReport).ok();
+                        sender.send(ClientControlPacket::RequestIdr).ok();
                     }
+                    warn!("Network dropped video packet");
                 }
 
-                if let Switch::Enabled(criteria) = &disconnection_critera {
-                    if let Some(stats) = &*STATISTICS_MANAGER.lock() {
-                        if stats.average_total_pipeline_latency()
-                            < Duration::from_millis(criteria.latency_threshold_ms)
-                        {
-                            disconnection_timer_begin = None;
-                        } else {
-                            let begin = disconnection_timer_begin.unwrap_or_else(Instant::now);
-
-                            if Instant::now()
-                                > begin + Duration::from_secs(criteria.sustain_duration_s)
-                            {
-                                DISCONNECT_NOTIFIER.notify_one();
-                            }
-
-                            disconnection_timer_begin = Some(begin);
+                if !stream_corrupted || !settings.connection.avoid_video_glitching {
+                    if !decoder::push_nal(header.timestamp, nal) {
+                        stream_corrupted = true;
+                        if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
+                            sender.send(ClientControlPacket::RequestIdr).ok();
                         }
+                        warn!("Dropped video packet. Reason: Decoder saturation")
                     }
+                } else {
+                    warn!("Dropped video packet. Reason: Waiting for IDR frame")
                 }
             }
         }
@@ -414,16 +410,15 @@ async fn stream_pipeline(
         }
     };
 
-    let game_audio_loop: BoxFuture<_> = if let Switch::Enabled(desc) = settings.audio.game_audio {
-        let device = AudioDevice::new(None, &AudioDeviceId::Default, AudioDeviceType::Output)
-            .map_err(err!())?;
+    let game_audio_loop: BoxFuture<_> = if let Switch::Enabled(config) = settings.audio.game_audio {
+        let device = AudioDevice::new_output(None, None).map_err(err!())?;
 
         let game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO).await?;
         Box::pin(audio::play_audio_loop(
             device,
             2,
             stream_config.game_audio_sample_rate,
-            desc.buffering_config,
+            config.buffering,
             game_audio_receiver,
         ))
     } else {
@@ -431,8 +426,7 @@ async fn stream_pipeline(
     };
 
     let microphone_loop: BoxFuture<_> = if matches!(settings.audio.microphone, Switch::Enabled(_)) {
-        let device = AudioDevice::new(None, &AudioDeviceId::Default, AudioDeviceType::Input)
-            .map_err(err!())?;
+        let device = AudioDevice::new_input(None).map_err(err!())?;
 
         let microphone_sender = stream_socket.request_stream(AUDIO).await?;
         Box::pin(audio::record_audio_loop(
@@ -511,18 +505,13 @@ async fn stream_pipeline(
     let control_receive_loop = async move {
         loop {
             match control_receiver.recv().await {
-                Ok(ServerControlPacket::InitializeDecoder { config_buffer }) => {
-                    decoder::create_decoder(config_buffer);
+                Ok(ServerControlPacket::InitializeDecoder(config)) => {
+                    decoder::create_decoder(config);
                 }
                 Ok(ServerControlPacket::Restarting) => {
                     info!("{SERVER_RESTART_MESSAGE}");
                     set_hud_message(SERVER_RESTART_MESSAGE);
                     break Ok(());
-                }
-                Ok(ServerControlPacket::ServerPredictionAverage(interval)) => {
-                    if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
-                        stats.report_server_prediction_average(interval);
-                    }
                 }
                 Ok(_) => (),
                 Err(e) => {

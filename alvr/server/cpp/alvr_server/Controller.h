@@ -35,8 +35,10 @@ class Controller : public TrackedDevice, public vr::ITrackedDeviceServerDriver {
 
     void SetButton(uint64_t id, FfiButtonValue value);
 
-    bool onPoseUpdate(float predictionS, FfiDeviceMotion motion, const FfiHandSkeleton *hand);
-    std::string GetSerialNumber();
+    bool onPoseUpdate(float predictionS,
+                      FfiDeviceMotion motion,
+                      const FfiHandSkeleton *hand,
+                      unsigned int controllersTracked);
 
     void GetBoneTransform(bool withController,
                           bool isLeftHand,
@@ -57,8 +59,8 @@ class Controller : public TrackedDevice, public vr::ITrackedDeviceServerDriver {
 
     vr::DriverPose_t m_pose;
 
-    float m_thumbAnimationProgress = 0;
-    float m_indexAnimationProgress = 0;
+    float m_thumbTouchAnimationProgress = 0;
+    float m_indexTouchAnimationProgress = 0;
     uint64_t m_lastThumbTouch = 0;
     uint64_t m_lastIndexTouch = 0;
 

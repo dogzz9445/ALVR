@@ -26,17 +26,16 @@ impl Display for Profile {
     }
 }
 
-pub fn build_server(
+pub fn build_streamer(
     profile: Profile,
     gpl: bool,
     root: Option<String>,
     reproducible: bool,
-    experiments: bool,
     keep_config: bool,
 ) {
     let sh = Shell::new().unwrap();
 
-    let build_layout = Layout::new(&afs::server_build_dir());
+    let build_layout = Layout::new(&afs::streamer_build_dir());
 
     let mut common_flags = vec![];
     match profile {
@@ -60,8 +59,8 @@ pub fn build_server(
         None
     };
 
-    sh.remove_path(&afs::server_build_dir()).unwrap();
-    sh.create_dir(&afs::server_build_dir()).unwrap();
+    sh.remove_path(&afs::streamer_build_dir()).unwrap();
+    sh.create_dir(&afs::streamer_build_dir()).unwrap();
     sh.create_dir(&build_layout.openvr_driver_lib_dir())
         .unwrap();
     sh.create_dir(&build_layout.executables_dir).unwrap();
@@ -98,18 +97,6 @@ pub fn build_server(
             )
             .unwrap();
         }
-    }
-
-    // build launcher
-    {
-        let _push_guard = sh.push_dir(afs::crate_dir("launcher"));
-        cmd!(sh, "cargo build {common_flags_ref...}").run().unwrap();
-
-        sh.copy_file(
-            artifacts_dir.join(afs::exec_fname("alvr_launcher")),
-            build_layout.launcher_exe(),
-        )
-        .unwrap();
     }
 
     // Build dashboard
@@ -180,56 +167,22 @@ pub fn build_server(
 
     // copy static resources
     {
-        // copy dashboard
-        command::copy_recursive(
-            &sh,
-            &afs::workspace_dir().join("dashboard"),
-            &build_layout.dashboard_dir(),
-        )
-        .unwrap();
-
-        // copy presets
-        command::copy_recursive(
-            &sh,
-            &afs::crate_dir("xtask").join("resources/presets"),
-            &build_layout.presets_dir(),
-        )
-        .ok();
-
         // copy driver manifest
         sh.copy_file(
             afs::crate_dir("xtask").join("resources/driver.vrdrivermanifest"),
-            &build_layout.openvr_driver_manifest(),
-        )
-        .unwrap();
-    }
-
-    // build experiments
-    if experiments {
-        command::copy_recursive(
-            &sh,
-            &afs::workspace_dir().join("experiments/gui/resources/languages"),
-            &build_layout.static_resources_dir.join("languages"),
-        )
-        .unwrap();
-
-        let _push_guard = sh.push_dir(afs::workspace_dir().join("experiments/launcher"));
-        cmd!(sh, "cargo build {common_flags_ref...}").run().unwrap();
-        sh.copy_file(
-            artifacts_dir.join(afs::exec_fname("launcher")),
-            build_layout
-                .executables_dir
-                .join(afs::exec_fname("experimental_launcher")),
+            build_layout.openvr_driver_manifest(),
         )
         .unwrap();
     }
 }
 
-pub fn build_client_lib(profile: Profile) {
+pub fn build_client_lib(profile: Profile, link_stdcpp: bool) {
     let sh = Shell::new().unwrap();
 
     let build_dir = afs::build_dir().join("alvr_client_core");
     sh.create_dir(&build_dir).unwrap();
+
+    let strip_flag = matches!(profile, Profile::Debug).then_some("--no-strip");
 
     let mut flags = vec![];
     match profile {
@@ -240,13 +193,16 @@ pub fn build_client_lib(profile: Profile) {
         Profile::Release => flags.push("--release"),
         Profile::Debug => (),
     }
+    if !link_stdcpp {
+        flags.push("--no-default-features");
+    }
     let flags_ref = &flags;
 
     let _push_guard = sh.push_dir(afs::crate_dir("client_core"));
 
     cmd!(
         sh,
-        "cargo ndk -t arm64-v8a -p 26 -o {build_dir} build {flags_ref...}"
+        "cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 -p 26 {strip_flag...} -o {build_dir} build {flags_ref...}"
     )
     .run()
     .unwrap();

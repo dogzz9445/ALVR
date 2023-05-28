@@ -21,6 +21,8 @@ mod audio;
 
 pub use decoder::get_frame;
 pub use logging_backend::init_logging;
+#[cfg(target_os = "android")]
+pub use platform::try_get_permission;
 
 use alvr_common::{
     glam::{UVec2, Vec2},
@@ -29,9 +31,10 @@ use alvr_common::{
     prelude::*,
     Fov, RelaxedAtomic,
 };
-use alvr_events::ButtonValue;
-use alvr_session::{CodecType, FoveatedRenderingDesc, OculusFovetionLevel};
-use alvr_sockets::{BatteryPacket, ClientControlPacket, ClientStatistics, Tracking, ViewsConfig};
+use alvr_packets::{
+    BatteryPacket, ButtonEntry, ClientControlPacket, ClientStatistics, Tracking, ViewsConfig,
+};
+use alvr_session::{CodecType, Settings};
 use decoder::EXTERNAL_DECODER;
 use serde::{Deserialize, Serialize};
 use statistics::StatisticsManager;
@@ -67,11 +70,8 @@ pub enum ClientCoreEvent {
     UpdateHudMessage(String),
     StreamingStarted {
         view_resolution: UVec2,
-        fps: f32,
-        foveated_rendering: Option<FoveatedRenderingDesc>,
-        oculus_foveation_level: OculusFovetionLevel,
-        dynamic_oculus_foveation: bool,
-        extra_latency: bool,
+        refresh_rate_hint: f32,
+        settings: Box<Settings>,
     },
     StreamingStopped,
     Haptics {
@@ -108,7 +108,7 @@ pub fn initialize(
     }
 
     #[cfg(target_os = "android")]
-    platform::try_get_microphone_permission();
+    platform::try_get_permission(platform::MICROPHONE_PERMISSION);
     #[cfg(target_os = "android")]
     platform::acquire_wifi_lock();
 
@@ -169,11 +169,9 @@ pub fn send_playspace(area: Option<Vec2>) {
     }
 }
 
-pub fn send_button(path_id: u64, value: ButtonValue) {
+pub fn send_buttons(entries: Vec<ButtonEntry>) {
     if let Some(sender) = &*CONTROL_CHANNEL_SENDER.lock() {
-        sender
-            .send(ClientControlPacket::Button { path_id, value })
-            .ok();
+        sender.send(ClientControlPacket::Buttons(entries)).ok();
     }
 }
 
@@ -193,7 +191,7 @@ pub fn get_head_prediction_offset() -> Duration {
 
 pub fn get_tracker_prediction_offset() -> Duration {
     if let Some(stats) = &*STATISTICS_MANAGER.lock() {
-        stats.get_tracker_prediction_offset()
+        stats.tracker_prediction_offset()
     } else {
         Duration::ZERO
     }

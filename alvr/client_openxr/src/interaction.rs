@@ -1,7 +1,6 @@
 use crate::{to_pose, to_quat, to_vec3, Platform};
 use alvr_common::{glam::Vec3, *};
-use alvr_events::ButtonValue;
-use alvr_sockets::{DeviceMotion, Pose};
+use alvr_packets::{ButtonEntry, ButtonValue};
 use openxr as xr;
 use std::collections::HashMap;
 
@@ -302,19 +301,18 @@ fn get_button_bindings(platform: Platform) -> HashMap<u64, ButtonBindingInfo> {
     map
 }
 
-pub struct StreamingInteractionContext {
+pub struct HandsInteractionContext {
     pub action_set: xr::ActionSet,
     pub button_actions: HashMap<u64, ButtonAction>,
-    pub left_hand_source: HandSource,
-    pub right_hand_source: HandSource,
+    pub hand_sources: [HandSource; 2],
 }
 
-pub fn initialize_streaming_interaction(
+pub fn initialize_hands_interaction(
     platform: Platform,
     xr_instance: &xr::Instance,
     xr_system: xr::SystemId,
     xr_session: &xr::Session<xr::AnyGraphics>,
-) -> StreamingInteractionContext {
+) -> HandsInteractionContext {
     let action_set = xr_instance
         .create_action_set("alvr_input", "ALVR input", 0)
         .unwrap();
@@ -424,35 +422,36 @@ pub fn initialize_streaming_interaction(
         .create_space(xr_session.clone(), xr::Path::NULL, xr::Posef::IDENTITY)
         .unwrap();
 
-    let (left_hand_tracker, right_hand_tracker) =
-        if xr_instance.supports_hand_tracking(xr_system).unwrap() {
-            (
-                Some(xr_session.create_hand_tracker(xr::Hand::LEFT).unwrap()),
-                Some(xr_session.create_hand_tracker(xr::Hand::RIGHT).unwrap()),
-            )
-        } else {
-            (None, None)
-        };
-
-    let left_hand_source = HandSource {
-        grip_action: left_grip_action,
-        grip_space: left_grip_space,
-        skeleton_tracker: left_hand_tracker,
-        vibration_action: left_vibration_action,
+    let (left_hand_tracker, right_hand_tracker) = if xr_instance.exts().ext_hand_tracking.is_some()
+        && xr_instance.supports_hand_tracking(xr_system).unwrap()
+    {
+        (
+            Some(xr_session.create_hand_tracker(xr::Hand::LEFT).unwrap()),
+            Some(xr_session.create_hand_tracker(xr::Hand::RIGHT).unwrap()),
+        )
+    } else {
+        (None, None)
     };
 
-    let right_hand_source = HandSource {
-        grip_action: right_grip_action,
-        grip_space: right_grip_space,
-        skeleton_tracker: right_hand_tracker,
-        vibration_action: right_vibration_action,
-    };
+    let hand_sources = [
+        HandSource {
+            grip_action: left_grip_action,
+            grip_space: left_grip_space,
+            skeleton_tracker: left_hand_tracker,
+            vibration_action: left_vibration_action,
+        },
+        HandSource {
+            grip_action: right_grip_action,
+            grip_space: right_grip_space,
+            skeleton_tracker: right_hand_tracker,
+            vibration_action: right_vibration_action,
+        },
+    ];
 
-    StreamingInteractionContext {
+    HandsInteractionContext {
         action_set,
         button_actions,
-        left_hand_source,
-        right_hand_source,
+        hand_sources,
     }
 }
 
@@ -462,16 +461,18 @@ pub fn get_hand_motion(
     time: xr::Time,
     hand_source: &HandSource,
     last_position: &mut Vec3,
-) -> StrResult<(Option<DeviceMotion>, Option<[Pose; 26]>)> {
+) -> (Option<DeviceMotion>, Option<[Pose; 26]>) {
     if hand_source
         .grip_action
         .is_active(session, xr::Path::NULL)
-        .map_err(err!())?
+        .unwrap_or(false)
     {
-        let (location, velocity) = hand_source
+        let Ok((location, velocity)) = hand_source
             .grip_space
             .relate(reference_space, time)
-            .map_err(err!())?;
+        else {
+            return (None, None);
+        };
 
         if location
             .location_flags
@@ -489,65 +490,98 @@ pub fn get_hand_motion(
             angular_velocity: to_vec3(velocity.angular_velocity),
         };
 
-        return Ok((Some(hand_motion), None));
+        return (Some(hand_motion), None);
     }
 
-    if let Some(tracker) = &hand_source.skeleton_tracker {
-        // todo: support also velocities in the protocol
-        if let Some((joint_locations, jont_velocities)) = reference_space
+    let Some(tracker) = &hand_source.skeleton_tracker else {
+        return (None, None);
+    };
+
+    let Some((joint_locations, jont_velocities)) = reference_space
             .relate_hand_joints(tracker, time)
-            .map_err(err!())?
-        {
-            let root_motion = DeviceMotion {
-                pose: to_pose(joint_locations[0].pose),
-                linear_velocity: to_vec3(jont_velocities[0].linear_velocity),
-                angular_velocity: to_vec3(jont_velocities[0].angular_velocity),
-            };
+            .ok().flatten()
+        else {
+            return (None, None);
+        };
 
-            let joints = joint_locations
-                .iter()
-                .map(|j| to_pose(j.pose))
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap();
+    let root_motion = DeviceMotion {
+        pose: to_pose(joint_locations[0].pose),
+        linear_velocity: to_vec3(jont_velocities[0].linear_velocity),
+        angular_velocity: to_vec3(jont_velocities[0].angular_velocity),
+    };
 
-            Ok((Some(root_motion), Some(joints)))
-        } else {
-            Ok((None, None))
-        }
-    } else {
-        Ok((None, None))
-    }
+    let joints = joint_locations
+        .iter()
+        .map(|j| to_pose(j.pose))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    (Some(root_motion), Some(joints))
 }
 
 // todo: move emulation to server
-fn emulate_missing_button_value(platform: Platform, click_action_id: u64, state: bool) {
-    let scalar_value = ButtonValue::Scalar(if state { 1_f32 } else { 0_f32 });
+fn emulate_missing_button_value(
+    platform: Platform,
+    click_action_id: u64,
+    state: bool,
+) -> Option<ButtonEntry> {
+    let value = ButtonValue::Scalar(if state { 1_f32 } else { 0_f32 });
 
     if platform == Platform::Yvr {
         if click_action_id == *LEFT_SQUEEZE_CLICK_ID {
-            alvr_client_core::send_button(*LEFT_SQUEEZE_VALUE_ID, scalar_value);
+            Some(ButtonEntry {
+                path_id: *LEFT_SQUEEZE_VALUE_ID,
+                value,
+            })
         } else if click_action_id == *RIGHT_SQUEEZE_CLICK_ID {
-            alvr_client_core::send_button(*RIGHT_SQUEEZE_VALUE_ID, scalar_value);
+            Some(ButtonEntry {
+                path_id: *RIGHT_SQUEEZE_VALUE_ID,
+                value,
+            })
+        } else {
+            None
         }
+    } else {
+        None
     }
 }
 
 // todo: use hysteresis
 // todo: move emulation to server
-fn emulate_missing_button_click(platform: Platform, value_action_id: u64, state: f32) {
-    let binary_value = ButtonValue::Binary(state > 0.5);
+fn emulate_missing_button_click(
+    platform: Platform,
+    value_action_id: u64,
+    state: f32,
+) -> Option<ButtonEntry> {
+    let value = ButtonValue::Binary(state > 0.5);
 
     if platform == Platform::Vive {
         if value_action_id == *LEFT_SQUEEZE_VALUE_ID {
-            alvr_client_core::send_button(*LEFT_SQUEEZE_CLICK_ID, binary_value);
+            Some(ButtonEntry {
+                path_id: *LEFT_SQUEEZE_CLICK_ID,
+                value,
+            })
         } else if value_action_id == *LEFT_TRIGGER_VALUE_ID {
-            alvr_client_core::send_button(*LEFT_TRIGGER_CLICK_ID, binary_value);
+            Some(ButtonEntry {
+                path_id: *LEFT_TRIGGER_CLICK_ID,
+                value,
+            })
         } else if value_action_id == *RIGHT_SQUEEZE_VALUE_ID {
-            alvr_client_core::send_button(*RIGHT_SQUEEZE_CLICK_ID, binary_value);
+            Some(ButtonEntry {
+                path_id: *RIGHT_SQUEEZE_CLICK_ID,
+                value,
+            })
         } else if value_action_id == *RIGHT_TRIGGER_VALUE_ID {
-            alvr_client_core::send_button(*RIGHT_TRIGGER_CLICK_ID, binary_value);
+            Some(ButtonEntry {
+                path_id: *RIGHT_TRIGGER_CLICK_ID,
+                value,
+            })
+        } else {
+            None
         }
+    } else {
+        None
     }
 }
 
@@ -555,29 +589,147 @@ pub fn update_buttons(
     platform: Platform,
     xr_session: &xr::Session<xr::AnyGraphics>,
     button_actions: &HashMap<u64, ButtonAction>,
-) -> StrResult {
+) -> Vec<ButtonEntry> {
+    let mut button_entries = Vec::with_capacity(2);
     for (id, action) in button_actions {
         match action {
             ButtonAction::Binary(action) => {
-                let state = action.state(xr_session, xr::Path::NULL).map_err(err!())?;
+                let Ok(state) = action.state(xr_session, xr::Path::NULL) else {
+                    continue;
+                };
 
                 if state.changed_since_last_sync {
-                    alvr_client_core::send_button(*id, ButtonValue::Binary(state.current_state));
+                    button_entries.push(ButtonEntry {
+                        path_id: *id,
+                        value: ButtonValue::Binary(state.current_state),
+                    });
 
-                    emulate_missing_button_value(platform, *id, state.current_state);
+                    if let Some(entry) =
+                        emulate_missing_button_value(platform, *id, state.current_state)
+                    {
+                        button_entries.push(entry);
+                    }
                 }
             }
             ButtonAction::Scalar(action) => {
-                let state = action.state(xr_session, xr::Path::NULL).map_err(err!())?;
+                let Ok(state) = action.state(xr_session, xr::Path::NULL) else {
+                    continue;
+                };
 
                 if state.changed_since_last_sync {
-                    alvr_client_core::send_button(*id, ButtonValue::Scalar(state.current_state));
+                    button_entries.push(ButtonEntry {
+                        path_id: *id,
+                        value: ButtonValue::Scalar(state.current_state),
+                    });
 
-                    emulate_missing_button_click(platform, *id, state.current_state);
+                    if let Some(entry) =
+                        emulate_missing_button_click(platform, *id, state.current_state)
+                    {
+                        button_entries.push(entry);
+                    }
                 }
             }
         }
     }
 
-    Ok(())
+    button_entries
+}
+
+pub struct FaceInputContext {
+    pub eye_tracker_fb: Option<xr::EyeTrackerSocial>,
+    pub face_tracker_fb: Option<xr::FaceTrackerFB>,
+    pub eye_tracker_htc: Option<xr::FacialTrackerHTC>,
+    pub lip_tracker_htc: Option<xr::FacialTrackerHTC>,
+}
+
+pub fn initialize_face_input<G>(
+    xr_instance: &xr::Instance,
+    xr_system: xr::SystemId,
+    xr_session: &xr::Session<G>,
+    eye_tracking_fb: bool,
+    face_tracking_fb: bool,
+    eye_expressions_htc: bool,
+    lip_expressions_htc: bool,
+) -> FaceInputContext {
+    let eye_tracker_fb = (eye_tracking_fb
+        && xr_instance.exts().fb_eye_tracking_social.is_some()
+        && xr_instance.supports_social_eye_tracking(xr_system).unwrap())
+    .then(|| xr_session.create_eye_tracker_social().unwrap());
+
+    let face_tracker_fb = (face_tracking_fb
+        && xr_instance.exts().fb_face_tracking.is_some()
+        && xr_instance.supports_fb_face_tracking(xr_system).unwrap())
+    .then(|| xr_session.create_face_tracker_fb().unwrap());
+
+    let eye_tracker_htc = (eye_expressions_htc
+        && xr_instance.exts().htc_facial_tracking.is_some()
+        && xr_instance
+            .supports_htc_eye_facial_tracking(xr_system)
+            .unwrap())
+    .then(|| {
+        xr_session
+            .create_facial_tracker_htc(xr::FacialTrackingTypeHTC::EYE_DEFAULT)
+            .unwrap()
+    });
+
+    let lip_tracker_htc = (lip_expressions_htc
+        && xr_instance.exts().htc_facial_tracking.is_some()
+        && xr_instance
+            .supports_htc_lip_facial_tracking(xr_system)
+            .unwrap())
+    .then(|| {
+        xr_session
+            .create_facial_tracker_htc(xr::FacialTrackingTypeHTC::LIP_DEFAULT)
+            .unwrap()
+    });
+
+    FaceInputContext {
+        eye_tracker_fb,
+        face_tracker_fb,
+        eye_tracker_htc,
+        lip_tracker_htc,
+    }
+}
+
+pub fn get_eye_gazes(
+    context: &FaceInputContext,
+    reference_space: &xr::Space,
+    time: xr::Time,
+) -> [Option<Pose>; 2] {
+    let Some(tracker) = &context.eye_tracker_fb else {
+        return [None, None]
+    };
+
+    if let Ok(gazes) = tracker.get_eye_gazes(reference_space, time) {
+        [
+            gazes.gaze[0].as_ref().map(|g| to_pose(g.pose)),
+            gazes.gaze[1].as_ref().map(|g| to_pose(g.pose)),
+        ]
+    } else {
+        [None, None]
+    }
+}
+
+pub fn get_fb_face_expression(context: &FaceInputContext, time: xr::Time) -> Option<Vec<f32>> {
+    context
+        .face_tracker_fb
+        .as_ref()
+        .and_then(|t| t.get_face_expression_weights(time).ok().flatten())
+        .map(|w| w.weights.into_iter().collect())
+}
+
+pub fn get_htc_eye_expression(context: &FaceInputContext) -> Option<Vec<f32>> {
+    context
+        .eye_tracker_htc
+        .as_ref()
+        .and_then(|t| t.get_facial_expressions().ok().flatten())
+        .map(|w| w.weights.into_iter().collect())
+}
+
+pub fn get_htc_lip_expression(context: &FaceInputContext) -> Option<Vec<f32>> {
+    context
+        .lip_tracker_htc
+        .as_ref()
+        .and_then(|t| t.get_facial_expressions().ok().flatten())
+        .map(|w| w.weights.into_iter().collect())
 }

@@ -1,9 +1,10 @@
 mod bitrate;
 mod buttons;
 mod connection;
-mod dashboard;
+mod face_tracking;
 mod haptics;
 mod logging_backend;
+mod openvr_props;
 mod sockets;
 mod statistics;
 mod tracking;
@@ -27,13 +28,15 @@ use alvr_common::{
     once_cell::sync::{Lazy, OnceCell},
     parking_lot::{Mutex, RwLock},
     prelude::*,
-    RelaxedAtomic, ALVR_VERSION,
+    RelaxedAtomic,
 };
 use alvr_events::EventType;
 use alvr_filesystem::{self as afs, Layout};
-use alvr_server_data::ServerDataManager;
-use alvr_session::{CodecType, OpenvrPropValue, OpenvrPropertyKey};
-use alvr_sockets::{ClientListAction, GpuVendor, Haptics, ServerControlPacket};
+use alvr_packets::{
+    ClientListAction, DecoderInitializationConfig, Haptics, ServerControlPacket, VideoPacketHeader,
+};
+use alvr_server_io::ServerDataManager;
+use alvr_session::CodecType;
 use bitrate::BitrateManager;
 use statistics::StatisticsManager;
 use std::{
@@ -43,44 +46,48 @@ use std::{
     io::Write,
     ptr,
     sync::{
-        self,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Once,
     },
     thread,
     time::{Duration, Instant},
 };
+use sysinfo::{ProcessRefreshKind, RefreshKind, SystemExt};
 use tokio::{
     runtime::Runtime,
-    sync::{broadcast, mpsc, Notify},
+    sync::{
+        broadcast,
+        mpsc::{self, error::TrySendError},
+        Notify,
+    },
 };
 
 static FILESYSTEM_LAYOUT: Lazy<Layout> = Lazy::new(|| {
-    afs::filesystem_layout_from_openvr_driver_root_dir(&alvr_commands::get_driver_dir().unwrap())
+    afs::filesystem_layout_from_openvr_driver_root_dir(&alvr_server_io::get_driver_dir().unwrap())
 });
 static SERVER_DATA_MANAGER: Lazy<RwLock<ServerDataManager>> =
     Lazy::new(|| RwLock::new(ServerDataManager::new(&FILESYSTEM_LAYOUT.session())));
 static WEBSERVER_RUNTIME: Lazy<Mutex<Option<Runtime>>> =
     Lazy::new(|| Mutex::new(Runtime::new().ok()));
-static WINDOW: Lazy<Mutex<Option<Arc<WindowType>>>> = Lazy::new(|| Mutex::new(None));
 
 static STATISTICS_MANAGER: Lazy<Mutex<Option<StatisticsManager>>> = Lazy::new(|| Mutex::new(None));
 static BITRATE_MANAGER: Lazy<Mutex<BitrateManager>> = Lazy::new(|| {
     let data_lock = SERVER_DATA_MANAGER.read();
+    let settings = data_lock.settings();
     Mutex::new(BitrateManager::new(
-        data_lock.settings().video.bitrate.clone(),
-        data_lock.settings().connection.statistics_history_size as usize,
+        settings.connection.statistics_history_size as usize,
+        settings.video.preferred_fps,
     ))
 });
 
 pub struct VideoPacket {
-    pub timestamp: Duration,
+    pub header: VideoPacketHeader,
     pub payload: Vec<u8>,
 }
 
 static CONTROL_CHANNEL_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<ServerControlPacket>>>> =
     Lazy::new(|| Mutex::new(None));
-static VIDEO_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<VideoPacket>>>> =
+static VIDEO_SENDER: Lazy<Mutex<Option<mpsc::Sender<VideoPacket>>>> =
     Lazy::new(|| Mutex::new(None));
 static HAPTICS_SENDER: Lazy<Mutex<Option<mpsc::UnboundedSender<Haptics>>>> =
     Lazy::new(|| Mutex::new(None));
@@ -90,6 +97,7 @@ static VIDEO_RECORDING_FILE: Lazy<Mutex<Option<File>>> = Lazy::new(|| Mutex::new
 
 static DISCONNECT_CLIENT_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 static RESTART_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
+static SHUTDOWN_NOTIFIER: Lazy<Notify> = Lazy::new(Notify::new);
 
 static FRAME_RENDER_VS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderVS.cso");
 static FRAME_RENDER_PS_CSO: &[u8] = include_bytes!("../cpp/platform/win32/FrameRenderPS.cso");
@@ -99,21 +107,16 @@ static COMPRESS_AXIS_ALIGNED_CSO: &[u8] =
 static COLOR_CORRECTION_CSO: &[u8] =
     include_bytes!("../cpp/platform/win32/ColorCorrectionPixelShader.cso");
 
-static QUAD_SHADER_VERT_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/quad.vert.spv");
-static QUAD_SHADER_FRAG_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/quad.frag.spv");
-static COLOR_SHADER_FRAG_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/color.frag.spv");
-static FFR_SHADER_FRAG_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/ffr.frag.spv");
+static QUAD_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/quad.comp.spv");
+static COLOR_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/color.comp.spv");
+static FFR_SHADER_COMP_SPV: &[u8] = include_bytes!("../cpp/platform/linux/shader/ffr.comp.spv");
 static RGBTOYUV420_SHADER_COMP_SPV: &[u8] =
     include_bytes!("../cpp/platform/linux/shader/rgbtoyuv420.comp.spv");
 
 static IS_ALIVE: Lazy<Arc<RelaxedAtomic>> = Lazy::new(|| Arc::new(RelaxedAtomic::new(false)));
 
-static DECODER_CONFIG: Lazy<Mutex<Option<Vec<u8>>>> = Lazy::new(|| Mutex::new(None));
-
-pub enum WindowType {
-    Alcro(alcro::UI),
-    Browser,
-}
+static DECODER_CONFIG: Lazy<Mutex<Option<DecoderInitializationConfig>>> =
+    Lazy::new(|| Mutex::new(None));
 
 fn to_ffi_quat(quat: Quat) -> FfiQuat {
     FfiQuat {
@@ -124,49 +127,8 @@ fn to_ffi_quat(quat: Quat) -> FfiQuat {
     }
 }
 
-pub fn to_ffi_openvr_prop(key: OpenvrPropertyKey, value: OpenvrPropValue) -> FfiOpenvrProperty {
-    let type_ = match value {
-        OpenvrPropValue::Bool(_) => FfiOpenvrPropertyType_Bool,
-        OpenvrPropValue::Float(_) => FfiOpenvrPropertyType_Float,
-        OpenvrPropValue::Int32(_) => FfiOpenvrPropertyType_Int32,
-        OpenvrPropValue::Uint64(_) => FfiOpenvrPropertyType_Uint64,
-        OpenvrPropValue::Vector3(_) => FfiOpenvrPropertyType_Vector3,
-        OpenvrPropValue::Double(_) => FfiOpenvrPropertyType_Double,
-        OpenvrPropValue::String(_) => FfiOpenvrPropertyType_String,
-    };
-
-    let value = match value {
-        OpenvrPropValue::Bool(bool_) => FfiOpenvrPropertyValue { bool_ },
-        OpenvrPropValue::Float(float_) => FfiOpenvrPropertyValue { float_ },
-        OpenvrPropValue::Int32(int32) => FfiOpenvrPropertyValue { int32 },
-        OpenvrPropValue::Uint64(uint64) => FfiOpenvrPropertyValue { uint64 },
-        OpenvrPropValue::Vector3(vector3) => FfiOpenvrPropertyValue { vector3 },
-        OpenvrPropValue::Double(double_) => FfiOpenvrPropertyValue { double_ },
-        OpenvrPropValue::String(value) => {
-            let c_string = CString::new(value).unwrap();
-            let mut string = [0; 64];
-
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    c_string.as_ptr(),
-                    string.as_mut_ptr(),
-                    c_string.as_bytes_with_nul().len(),
-                );
-            }
-
-            FfiOpenvrPropertyValue { string }
-        }
-    };
-
-    FfiOpenvrProperty {
-        key: key as u32,
-        type_,
-        value,
-    }
-}
-
 pub fn create_recording_file() {
-    let codec = SERVER_DATA_MANAGER.read().settings().video.codec;
+    let codec = SERVER_DATA_MANAGER.read().settings().video.preferred_codec;
     let ext = if matches!(codec, CodecType::H264) {
         "h264"
     } else {
@@ -178,7 +140,7 @@ pub fn create_recording_file() {
     match File::create(path) {
         Ok(mut file) => {
             if let Some(config) = &*DECODER_CONFIG.lock() {
-                file.write_all(config).ok();
+                file.write_all(&config.config_buffer).ok();
             }
 
             *VIDEO_RECORDING_FILE.lock() = Some(file);
@@ -191,17 +153,19 @@ pub fn create_recording_file() {
     }
 }
 
-pub fn shutdown_runtimes() {
-    alvr_events::send_event(EventType::ServerQuitting);
-
-    // Shutsdown all connection runtimes
+pub fn shutdown_tasks() {
+    // Invoke connection runtimes shutdown
+    // todo: block until they shutdown
     IS_ALIVE.set(false);
 
-    if let Some(window_type) = WINDOW.lock().take() {
-        match window_type.as_ref() {
-            WindowType::Alcro(window) => window.close(),
-            WindowType::Browser => (),
-        }
+    if let Some(backup) = SERVER_DATA_MANAGER
+        .write()
+        .session_mut()
+        .drivers_backup
+        .take()
+    {
+        alvr_server_io::driver_registration(&backup.other_paths, true).ok();
+        alvr_server_io::driver_registration(&[backup.alvr_path], false).ok();
     }
 
     WEBSERVER_RUNTIME.lock().take();
@@ -209,88 +173,71 @@ pub fn shutdown_runtimes() {
 
 pub fn notify_shutdown_driver() {
     thread::spawn(|| {
-        RESTART_NOTIFIER.notify_waiters();
+        SHUTDOWN_NOTIFIER.notify_waiters();
 
-        // give time to the control loop to send the restart packet (not crucial)
-        thread::sleep(Duration::from_millis(100));
-
-        shutdown_runtimes();
+        shutdown_tasks();
 
         unsafe { ShutdownSteamvr() };
     });
 }
 
 pub fn notify_restart_driver() {
-    notify_shutdown_driver();
+    {
+        let mut system = sysinfo::System::new_with_specifics(
+            RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes();
 
-    alvr_commands::restart_steamvr(&FILESYSTEM_LAYOUT.launcher_exe()).ok();
-}
+        if system
+            .processes_by_name(afs::dashboard_fname())
+            .next()
+            .is_some()
+        {
+            alvr_events::send_event(EventType::ServerRequestsSelfRestart);
+        } else {
+            error!("Cannot restart SteamVR. No dashboard process found on local device.");
 
-pub fn notify_application_update() {
-    notify_shutdown_driver();
+            return;
+        }
+    }
 
-    alvr_commands::invoke_application_update(&FILESYSTEM_LAYOUT.launcher_exe()).ok();
+    thread::spawn(|| {
+        RESTART_NOTIFIER.notify_waiters();
+
+        // give time to the control loop to send the restart packet (not crucial)
+        thread::sleep(Duration::from_millis(200));
+
+        shutdown_tasks();
+
+        unsafe { ShutdownSteamvr() };
+    });
 }
 
 fn init() {
-    let (log_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
-    let (legacy_events_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
     let (events_sender, _) = broadcast::channel(web_server::WS_BROADCAST_CAPACITY);
-    logging_backend::init_logging(
-        log_sender.clone(),
-        legacy_events_sender.clone(),
-        events_sender.clone(),
-    );
+    logging_backend::init_logging(events_sender.clone());
 
     if let Some(runtime) = WEBSERVER_RUNTIME.lock().as_mut() {
-        // Acquire and drop the data manager lock to create session.json if not present
-        // this is needed until Settings.cpp is replaced with Rust. todo: remove
-        SERVER_DATA_MANAGER.write().session_mut();
-
-        let connections = SERVER_DATA_MANAGER
-            .read()
-            .session()
-            .client_connections
-            .clone();
-        for (hostname, connection) in connections {
-            if !connection.trusted {
-                SERVER_DATA_MANAGER
-                    .write()
-                    .update_client_list(hostname, ClientListAction::RemoveEntry);
-            }
-        }
-
         runtime.spawn(alvr_common::show_err_async(web_server::web_server(
-            log_sender,
-            legacy_events_sender,
             events_sender,
         )));
-
-        thread::spawn(|| alvr_common::show_err(dashboard::ui_thread()));
     }
 
     {
-        let mut data_manager = SERVER_DATA_MANAGER.write();
-        if data_manager
-            .get_gpu_vendors()
-            .iter()
-            .any(|vendor| matches!(vendor, GpuVendor::Nvidia))
+        let mut data_manager_lock = SERVER_DATA_MANAGER.write();
+
+        let connections = data_manager_lock.session().client_connections.clone();
+        for (hostname, connection) in connections {
+            if !connection.trusted {
+                data_manager_lock.update_client_list(hostname, ClientListAction::RemoveEntry);
+            }
+        }
+
+        for conn in data_manager_lock
+            .session_mut()
+            .client_connections
+            .values_mut()
         {
-            data_manager
-                .session_mut()
-                .session_settings
-                .extra
-                .patches
-                .linux_async_reprojection = false;
-        }
-
-        if data_manager.session().server_version != *ALVR_VERSION {
-            let mut session_ref = data_manager.session_mut();
-            session_ref.server_version = ALVR_VERSION.clone();
-            session_ref.client_connections.clear();
-        }
-
-        for conn in data_manager.session_mut().client_connections.values_mut() {
             conn.current_ip = None;
         }
     }
@@ -329,14 +276,12 @@ pub unsafe extern "C" fn HmdDriverFactory(
     COMPRESS_AXIS_ALIGNED_CSO_LEN = COMPRESS_AXIS_ALIGNED_CSO.len() as _;
     COLOR_CORRECTION_CSO_PTR = COLOR_CORRECTION_CSO.as_ptr();
     COLOR_CORRECTION_CSO_LEN = COLOR_CORRECTION_CSO.len() as _;
-    QUAD_SHADER_VERT_SPV_PTR = QUAD_SHADER_VERT_SPV.as_ptr();
-    QUAD_SHADER_VERT_SPV_LEN = QUAD_SHADER_VERT_SPV.len() as _;
-    QUAD_SHADER_FRAG_SPV_PTR = QUAD_SHADER_FRAG_SPV.as_ptr();
-    QUAD_SHADER_FRAG_SPV_LEN = QUAD_SHADER_FRAG_SPV.len() as _;
-    COLOR_SHADER_FRAG_SPV_PTR = COLOR_SHADER_FRAG_SPV.as_ptr();
-    COLOR_SHADER_FRAG_SPV_LEN = COLOR_SHADER_FRAG_SPV.len() as _;
-    FFR_SHADER_FRAG_SPV_PTR = FFR_SHADER_FRAG_SPV.as_ptr();
-    FFR_SHADER_FRAG_SPV_LEN = FFR_SHADER_FRAG_SPV.len() as _;
+    QUAD_SHADER_COMP_SPV_PTR = QUAD_SHADER_COMP_SPV.as_ptr();
+    QUAD_SHADER_COMP_SPV_LEN = QUAD_SHADER_COMP_SPV.len() as _;
+    COLOR_SHADER_COMP_SPV_PTR = COLOR_SHADER_COMP_SPV.as_ptr();
+    COLOR_SHADER_COMP_SPV_LEN = COLOR_SHADER_COMP_SPV.len() as _;
+    FFR_SHADER_COMP_SPV_PTR = FFR_SHADER_COMP_SPV.as_ptr();
+    FFR_SHADER_COMP_SPV_LEN = FFR_SHADER_COMP_SPV.len() as _;
     RGBTOYUV420_SHADER_COMP_SPV_PTR = RGBTOYUV420_SHADER_COMP_SPV.as_ptr();
     RGBTOYUV420_SHADER_COMP_SPV_LEN = RGBTOYUV420_SHADER_COMP_SPV.len() as _;
 
@@ -380,7 +325,13 @@ pub unsafe extern "C" fn HmdDriverFactory(
         }
     }
 
-    extern "C" fn initialize_decoder(buffer_ptr: *const u8, len: i32) {
+    extern "C" fn initialize_decoder(buffer_ptr: *const u8, len: i32, codec: i32) {
+        let codec = if codec == 0 {
+            CodecType::H264
+        } else {
+            CodecType::Hevc
+        };
+
         let mut config_buffer = vec![0; len as usize];
 
         unsafe { ptr::copy_nonoverlapping(buffer_ptr, config_buffer.as_mut_ptr(), len as usize) };
@@ -393,11 +344,20 @@ pub unsafe extern "C" fn HmdDriverFactory(
             file.write_all(&config_buffer).ok();
         }
 
-        *DECODER_CONFIG.lock() = Some(config_buffer);
+        *DECODER_CONFIG.lock() = Some(DecoderInitializationConfig {
+            codec,
+            config_buffer,
+        });
     }
 
-    extern "C" fn video_send(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32) {
+    extern "C" fn video_send(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
+        // start in the corrupts state, the client didn't receive the initial IDR yet.
+        static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
         if let Some(sender) = &*VIDEO_SENDER.lock() {
+            if is_idr {
+                STREAM_CORRUPTED.store(false, Ordering::SeqCst);
+            }
+
             let timestamp = Duration::from_nanos(timestamp_ns);
 
             let mut payload = vec![0; len as _];
@@ -407,15 +367,35 @@ pub unsafe extern "C" fn HmdDriverFactory(
                 ptr::copy_nonoverlapping(buffer_ptr, payload.as_mut_ptr(), len as _);
             }
 
-            if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
-                sender.send(payload.clone()).ok();
-            }
+            if !STREAM_CORRUPTED.load(Ordering::SeqCst)
+                || !SERVER_DATA_MANAGER
+                    .read()
+                    .settings()
+                    .connection
+                    .avoid_video_glitching
+            {
+                if let Some(sender) = &*VIDEO_MIRROR_SENDER.lock() {
+                    sender.send(payload.clone()).ok();
+                }
 
-            if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {
-                file.write_all(&payload).ok();
-            }
+                if let Some(file) = &mut *VIDEO_RECORDING_FILE.lock() {
+                    file.write_all(&payload).ok();
+                }
 
-            sender.send(VideoPacket { timestamp, payload }).ok();
+                if matches!(
+                    sender.try_send(VideoPacket {
+                        header: VideoPacketHeader { timestamp, is_idr },
+                        payload,
+                    }),
+                    Err(TrySendError::Full(_))
+                ) {
+                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+                    unsafe { crate::RequestIDR() };
+                    warn!("Dropping video packet. Reason: Can't push to network");
+                }
+            } else {
+                warn!("Dropping video packet. Reason: Waiting for IDR frame");
+            }
 
             if let Some(stats) = &mut *STATISTICS_MANAGER.lock() {
                 stats.report_video_packet(len as _);
@@ -430,7 +410,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
         if let Some(sender) = &*HAPTICS_SENDER.lock() {
             let haptics = Haptics {
                 device_id,
-                duration: Duration::from_secs_f32(duration_s),
+                duration: Duration::from_secs_f32(f32::max(duration_s, 0.0)),
                 frequency,
                 amplitude,
             };
@@ -440,13 +420,7 @@ pub unsafe extern "C" fn HmdDriverFactory(
     }
 
     pub extern "C" fn driver_ready_idle(set_default_chap: bool) {
-        alvr_common::show_err(alvr_commands::apply_driver_paths_backup(
-            FILESYSTEM_LAYOUT.openvr_driver_root_dir.clone(),
-        ));
-
         IS_ALIVE.set(true);
-
-        let (frame_interval_sender, frame_interval_receiver) = sync::mpsc::channel();
 
         thread::spawn(move || {
             if set_default_chap {
@@ -455,35 +429,14 @@ pub unsafe extern "C" fn HmdDriverFactory(
                 unsafe { SetChaperone(2.0, 2.0) };
             }
 
-            if let Err(InterruptibleError::Other(e)) =
-                connection::handshake_loop(frame_interval_sender)
-            {
+            if let Err(InterruptibleError::Other(e)) = connection::handshake_loop() {
                 warn!("Connection thread closed: {e}");
             }
         });
-
-        if cfg!(windows) {
-            // Vsync thread
-            thread::spawn(move || {
-                let mut frame_interval = Duration::from_millis(20);
-                let mut deadline = Instant::now();
-
-                while IS_ALIVE.value() {
-                    unsafe { crate::SendVSync(frame_interval.as_secs_f32()) };
-
-                    while let Ok(interval) = frame_interval_receiver.try_recv() {
-                        frame_interval = interval;
-                    }
-
-                    deadline += frame_interval;
-                    spin_sleep::sleep(deadline.saturating_duration_since(Instant::now()));
-                }
-            });
-        }
     }
 
     extern "C" fn _shutdown_runtime() {
-        shutdown_runtimes();
+        shutdown_tasks();
     }
 
     unsafe extern "C" fn path_string_to_hash(path: *const c_char) -> u64 {
@@ -498,7 +451,14 @@ pub unsafe extern "C" fn HmdDriverFactory(
             );
         }
 
-        BITRATE_MANAGER.lock().report_frame_resent();
+        BITRATE_MANAGER.lock().report_frame_present(
+            &SERVER_DATA_MANAGER
+                .read()
+                .settings()
+                .video
+                .bitrate
+                .adapt_to_framerate,
+        );
     }
 
     extern "C" fn report_composed(timestamp_ns: u64, offset_ns: u64) {
@@ -517,7 +477,20 @@ pub unsafe extern "C" fn HmdDriverFactory(
     }
 
     extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
-        BITRATE_MANAGER.lock().get_encoder_params()
+        BITRATE_MANAGER
+            .lock()
+            .get_encoder_params(&SERVER_DATA_MANAGER.read().settings().video.bitrate)
+    }
+
+    extern "C" fn wait_for_vsync() {
+        let wait_duration = STATISTICS_MANAGER
+            .lock()
+            .as_mut()
+            .map(|stats| stats.duration_until_next_vsync());
+
+        if let Some(duration) = wait_duration {
+            thread::sleep(duration);
+        }
     }
 
     LogError = Some(log_error);
@@ -534,7 +507,10 @@ pub unsafe extern "C" fn HmdDriverFactory(
     ReportPresent = Some(report_present);
     ReportComposed = Some(report_composed);
     ReportEncoded = Some(report_encoded);
+    GetSerialNumber = Some(openvr_props::get_serial_number);
+    SetOpenvrProps = Some(openvr_props::set_device_openvr_props);
     GetDynamicEncoderParams = Some(get_dynamic_encoder_params);
+    WaitForVSync = Some(wait_for_vsync);
 
     // cast to usize to allow the variables to cross thread boundaries
     let interface_name_usize = interface_name as usize;
